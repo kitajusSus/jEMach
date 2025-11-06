@@ -2,6 +2,7 @@
 
 A comprehensive Neovim plugin for Julia development with an integrated REPL, workspace panel, and unified workflow mode for fast and efficient coding.
 
+
 ## Features
 
 ### 🚀 Core Features
@@ -265,9 +266,14 @@ When your cursor is inside any of these blocks, `:Js` will send the entire block
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Please feel free to submit a Pull Request with our idea
 
 
 ## Credits
 
-Inspired by the Julia community's excellent REPL-driven development workflow.
+- *My Dad and My Mum* 
+- My future wife
+
+## 
+> readme is 99% created by vibes
+
