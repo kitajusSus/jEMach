@@ -29,7 +29,7 @@ Easy navigation between all three components with configurable keybindings!
 
 ```lua
 {
-  "kitajusSus/Harper-nvim-julia",
+  "kitajusSus/jEMach",
   dependencies = {
     "akinsho/toggleterm.nvim",  -- Optional, only if using toggleterm mode
     "nvim-telescope/telescope.nvim",  -- Optional, for command history
@@ -67,7 +67,7 @@ Easy navigation between all three components with configurable keybindings!
 
 ```lua
 use {
-  "kitajusSus/Harper-nvim-julia",
+  "kitajusSus/jEMach",
   requires = {
     "akinsho/toggleterm.nvim",
     "nvim-telescope/telescope.nvim",
