@@ -6,11 +6,23 @@ local workspace_bufnr = nil
 local workspace_win_id = nil
 local workspace_tmp_file = vim.fn.stdpath("cache") .. "/jemach.log"
 local history_file = vim.fn.stdpath("cache") .. "/julia_history.log"
+local workspace_save_file = vim.fn.stdpath("cache") .. "/julia_workspace_save.jl"
 local command_history = {}
 local last_code_win = nil
 local workflow_mode_active = false
 local terminal_bufnr = nil
 local terminal_win_id = nil
+
+local workspace_cache = {
+	last_update = 0,
+	data = nil,
+	debounce_timer = nil,
+}
+
+local repl_monitor = {
+	last_line_count = 0,
+	autocmd_id = nil,
+}
 
 M.config = {
 	activate_project_on_start = true,
@@ -22,10 +34,28 @@ M.config = {
 	terminal_direction = "horizontal",
 	terminal_size = 15,
 	workspace_style = "detailed",
+	auto_save_workspace = false,
+	save_on_exit = true,
+	backend = "auto",
+	slime_target = "tmux",
+	slime_default_config = {
+		socket_name = "default",
+		target_pane = "{right-of}",
+	},
+	workspace_update_debounce = 300,
+	use_cache = true,
+	cache_ttl = 5000,
+	lsp = {
+		enabled = false,
+		auto_start = true,
+		detect_imports = true,
+		show_import_status = true,
+	},
 	layout_mode = "vertical_split",
 	terminal_type = "native",
 	lualine_integration = true,
 	lualine_colors = nil, -- Custom colors for lualine component, nil = auto
+
 	keybindings = {
 		toggle_repl = "<C-\\>",
 		focus_repl = "<A-1>",
@@ -39,10 +69,121 @@ M.config = {
 function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 	M.load_history()
+
+	-- Auto-detect backend if set to "auto"
+	if M.config.backend == "auto" then
+		M.config.backend = M.detect_backend()
+	end
+
+	-- Setup LSP integration if enabled
+	if M.config.lsp and M.config.lsp.enabled then
+		local lsp = require("jemach.lsp")
+		lsp.config = vim.tbl_deep_extend("force", lsp.config, M.config.lsp)
+
+		if M.config.lsp.auto_start then
+			vim.api.nvim_create_autocmd("FileType", {
+				pattern = "julia",
+				callback = function()
+					lsp.setup_lsp(M.config.lsp.lsp_config or {})
+				end,
+			})
+		end
+	end
+
+	-- Setup integrations
 	M.setup_global_keybindings()
 
 	if M.config.lualine_integration then
 		vim.defer_fn(M.setup_lualine, 100)
+	end
+end
+local function detect_backend()
+	local slime_ok, has_slime = pcall(function()
+		return vim.g.slime_target ~= nil or vim.fn.exists("*slime#send") == 1
+	end)
+
+	if slime_ok and has_slime then
+		return "vim-slime"
+	end
+
+	local tt_ok = pcall(require, "toggleterm")
+	if tt_ok then
+		return "toggleterm"
+	end
+
+	return "toggleterm"
+end
+
+M.detect_backend = detect_backend
+
+local function get_active_backend()
+	return M.config.backend
+end
+
+local function is_native_terminal_running()
+	return terminal_bufnr and vim.api.nvim_buf_is_valid(terminal_bufnr)
+end
+
+local function is_repl_running()
+	if M.config.terminal_type == "native" then
+		return is_native_terminal_running()
+	end
+
+	local backend = get_active_backend()
+
+	if backend == "vim-slime" then
+		return vim.g.slime_target ~= nil or M.config.slime_target ~= nil
+	elseif backend == "toggleterm" then
+		if not julia_terminal_obj then
+			return false
+		end
+
+		if not julia_terminal_obj.job_id then
+			return false
+		end
+
+		local job_status = vim.fn.jobwait({ julia_terminal_obj.job_id }, 0)[1]
+		return job_status == -1
+	end
+
+	return false
+end
+local function send_to_backend(code)
+	local backend = get_active_backend()
+
+	if backend == "vim-slime" then
+		if vim.fn.exists("*slime#send") == 1 then
+			vim.fn["slime#send"](code .. "\n")
+		else
+			local target = M.config.slime_target
+			if target == "tmux" then
+				local config = M.config.slime_default_config
+				local socket = config.socket_name or "default"
+				local pane = config.target_pane or "{right-of}"
+
+				local cmd = string.format(
+					"tmux -L %s send-keys -t %s -l %s",
+					vim.fn.shellescape(socket),
+					vim.fn.shellescape(pane),
+					vim.fn.shellescape(code)
+				)
+				vim.fn.system(cmd)
+				local enter_cmd = string.format(
+					"tmux -L %s send-keys -t %s Enter",
+					vim.fn.shellescape(socket),
+					vim.fn.shellescape(pane)
+				)
+				vim.fn.system(enter_cmd)
+			elseif target == "screen" then
+				vim.notify("⚠️ Screen support requires vim-slime plugin", vim.log.levels.WARN)
+			end
+		end
+	elseif backend == "toggleterm" then
+		if M.config.terminal_type == "native" then
+			send_to_native_terminal(code)
+		elseif julia_terminal_obj then
+			julia_terminal_obj:send(code .. "\n")
+		end
 	end
 end
 
@@ -59,27 +200,6 @@ local function find_project_root()
 		return nil
 	end
 	return vim.fn.fnamemodify(root_files[1], ":p:h")
-end
-
-local function is_native_terminal_running()
-	return terminal_bufnr and vim.api.nvim_buf_is_valid(terminal_bufnr)
-end
-
-local function is_repl_running()
-	if M.config.terminal_type == "native" then
-		return is_native_terminal_running()
-	end
-
-	if not julia_terminal_obj then
-		return false
-	end
-
-	if not julia_terminal_obj.job_id then
-		return false
-	end
-
-	local job_status = vim.fn.jobwait({ julia_terminal_obj.job_id }, 0)[1]
-	return job_status == -1
 end
 
 local function detect_julia_block()
@@ -142,14 +262,16 @@ local function get_code_to_send()
 	if mode == "v" or mode == "V" then
 		local _, start_row, start_col, _ = unpack(vim.fn.getpos("'<"))
 		local _, end_row, end_col, _ = unpack(vim.fn.getpos("'>"))
-		if mode == "V" then
-			start_col = 1
-			end_col = 9999
-		end
 		local lines = vim.api.nvim_buf_get_lines(0, start_row - 1, end_row, false)
+
 		if #lines == 0 then
 			return ""
 		end
+
+		if mode == "V" then
+			return table.concat(lines, "\n")
+		end
+
 		if #lines == 1 then
 			lines[1] = string.sub(lines[1], start_col, end_col)
 		else
@@ -170,15 +292,75 @@ local function get_code_to_send()
 	end
 end
 
+local function setup_repl_monitor(bufnr)
+	if not M.config.auto_update_workspace then
+		return
+	end
+
+	-- Remove previous autocmd if exists
+	if repl_monitor.autocmd_id then
+		pcall(vim.api.nvim_del_autocmd, repl_monitor.autocmd_id)
+		repl_monitor.autocmd_id = nil
+	end
+
+	-- Monitor buffer changes to detect when Julia prompt appears (command completed)
+	repl_monitor.autocmd_id = vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+		buffer = bufnr,
+		callback = function()
+			if not workspace_bufnr or not vim.api.nvim_buf_is_valid(workspace_bufnr) then
+				return
+			end
+
+			local line_count = vim.api.nvim_buf_line_count(bufnr)
+
+			-- Only proceed if buffer has new lines
+			if line_count <= repl_monitor.last_line_count then
+				repl_monitor.last_line_count = line_count
+				return
+			end
+
+			repl_monitor.last_line_count = line_count
+
+			-- Get the last few lines to check for Julia prompt
+			local last_lines = vim.api.nvim_buf_get_lines(bufnr, math.max(0, line_count - 3), line_count, false)
+			local last_text = table.concat(last_lines, "\n")
+
+			-- Check if Julia prompt is present (julia> or prompt style markers)
+			-- This indicates command execution is complete
+			if last_text:match("julia>") or last_text:match("@v[%d%.]+%) pkg>") or last_text:match("shell>") then
+				-- Debounce workspace updates
+				if workspace_cache.debounce_timer then
+					workspace_cache.debounce_timer:close()
+					workspace_cache.debounce_timer = nil
+				end
+
+				workspace_cache.debounce_timer = vim.loop.new_timer()
+				workspace_cache.debounce_timer:start(
+					M.config.workspace_update_debounce,
+					0,
+					vim.schedule_wrap(function()
+						M.update_workspace_panel()
+						if workspace_cache.debounce_timer then
+							workspace_cache.debounce_timer:close()
+							workspace_cache.debounce_timer = nil
+						end
+					end)
+				)
+			end
+		end,
+	})
+end
+
 local function start_native_terminal()
 	if terminal_bufnr and vim.api.nvim_buf_is_valid(terminal_bufnr) then
 		return true
 	end
 
-	-- Create buffer but don't set buftype yet
 	terminal_bufnr = vim.api.nvim_create_buf(false, true)
 
-	local ok, _ = pcall(vim.api.nvim_buf_set_option, terminal_bufnr, "bufhidden", "hide")
+	local ok, _ = pcall(function()
+		vim.bo[terminal_bufnr].bufhidden = "hide"
+	end)
 	if not ok then
 		vim.notify("❌ Failed to configure terminal buffer", vim.log.levels.ERROR)
 		return false
@@ -208,6 +390,10 @@ local function open_terminal_in_window(bufnr, cmd)
 		on_exit = function()
 			terminal_bufnr = nil
 			terminal_win_id = nil
+			if repl_monitor.autocmd_id then
+				pcall(vim.api.nvim_del_autocmd, repl_monitor.autocmd_id)
+				repl_monitor.autocmd_id = nil
+			end
 		end,
 	})
 
@@ -216,17 +402,24 @@ local function open_terminal_in_window(bufnr, cmd)
 		return false
 	end
 
+	-- Setup monitoring for workspace auto-update
+	vim.defer_fn(function()
+		setup_repl_monitor(bufnr)
+	end, 1000)
+
 	return true
 end
 
-local function send_to_native_terminal(text)
+function send_to_native_terminal(text)
 	if not is_native_terminal_running() then
 		return false
 	end
 
-	local ok, chan = pcall(vim.api.nvim_buf_get_option, terminal_bufnr, "channel")
+	local ok, chan = pcall(function()
+		return vim.bo[terminal_bufnr].channel
+	end)
 	if not ok or not chan or chan <= 0 then
-		vim.notify("⚠️  Terminal channel not available", vim.log.levels.WARN)
+		vim.notify("⚠️ Terminal channel not available", vim.log.levels.WARN)
 		return false
 	end
 
@@ -264,6 +457,10 @@ function M.toggle_repl()
 				open_terminal_in_window(bufnr, cmd)
 			else
 				vim.api.nvim_win_set_buf(terminal_win_id, bufnr)
+				-- Setup monitor for existing terminal
+				vim.defer_fn(function()
+					setup_repl_monitor(bufnr)
+				end, 100)
 			end
 			vim.cmd("wincmd L")
 		else
@@ -273,12 +470,15 @@ function M.toggle_repl()
 				open_terminal_in_window(bufnr, cmd)
 			else
 				vim.api.nvim_win_set_buf(terminal_win_id, bufnr)
+				-- Setup monitor for existing terminal
+				vim.defer_fn(function()
+					setup_repl_monitor(bufnr)
+				end, 100)
 			end
 		end
 		return
 	end
 
-	-- Original toggleterm implementation
 	local tt_ok, toggleterm = pcall(require, "toggleterm")
 	if not tt_ok then
 		vim.notify("❌ Toggleterm.nvim not installed", vim.log.levels.ERROR)
@@ -322,13 +522,53 @@ function M.toggle_repl()
 		on_open = function(t)
 			julia_terminal_id = t.id
 			vim.notify("✅ Julia REPL started", vim.log.levels.INFO)
+
+			vim.keymap.set("t", "<C-\\>", function()
+				if julia_terminal_obj then
+					julia_terminal_obj:toggle()
+				end
+			end, { buffer = t.bufnr, desc = "Toggle Julia REPL" })
+
+			-- Setup monitoring for workspace auto-update
+			vim.defer_fn(function()
+				setup_repl_monitor(t.bufnr)
+			end, 1000)
+
+			if M.config.auto_save_workspace then
+				vim.defer_fn(function()
+					if vim.fn.filereadable(workspace_save_file) == 1 then
+						M.restore_workspace()
+					end
+				end, 1000)
+			end
 		end,
 		on_close = function(_)
-			julia_terminal_id = nil
-			julia_terminal_obj = nil
-			vim.notify("⚠️  Julia REPL closed", vim.log.levels.WARN)
+			-- Cleanup monitor
+			if repl_monitor.autocmd_id then
+				pcall(vim.api.nvim_del_autocmd, repl_monitor.autocmd_id)
+				repl_monitor.autocmd_id = nil
+			end
+
+			if M.config.save_on_exit then
+				M.save_workspace()
+				vim.defer_fn(function()
+					julia_terminal_id = nil
+					julia_terminal_obj = nil
+				end, 1000)
+			else
+				julia_terminal_id = nil
+				julia_terminal_obj = nil
+			end
+
+			vim.notify("⚠️ Julia REPL closed", vim.log.levels.WARN)
 		end,
 		on_exit = function(_)
+			-- Cleanup monitor
+			if repl_monitor.autocmd_id then
+				pcall(vim.api.nvim_del_autocmd, repl_monitor.autocmd_id)
+				repl_monitor.autocmd_id = nil
+			end
+
 			julia_terminal_id = nil
 			julia_terminal_obj = nil
 		end,
@@ -393,7 +633,9 @@ local function add_to_history(code)
 end
 
 function M.send_to_repl()
-	if not is_repl_running() then
+	local backend = get_active_backend()
+
+	if (backend == "toggleterm" or M.config.terminal_type == "native") and not is_repl_running() then
 		vim.notify("🔄 Starting Julia REPL...", vim.log.levels.WARN)
 		M.toggle_repl()
 
@@ -414,31 +656,31 @@ function M.send_to_repl()
 
 	add_to_history(code)
 
-	local lines_to_send = {}
-	for s in string.gmatch(code, "[^\r\n]+") do
-		table.insert(lines_to_send, s)
-	end
-
-	if #lines_to_send == 0 then
-		return
-	end
-
-	local code_to_send = table.concat(lines_to_send, "\n") .. "\n"
-
-	if M.config.terminal_type == "native" then
-		send_to_native_terminal(code_to_send)
-	else
-		julia_terminal_obj:send(code_to_send)
-	end
+	send_to_backend(code)
 
 	if M.config.auto_update_workspace and workspace_bufnr and vim.api.nvim_buf_is_valid(workspace_bufnr) then
-		vim.defer_fn(M.update_workspace_panel, 300)
+		if workspace_cache.debounce_timer then
+			workspace_cache.debounce_timer:close()
+			workspace_cache.debounce_timer = nil
+		end
+		workspace_cache.debounce_timer = vim.loop.new_timer()
+		workspace_cache.debounce_timer:start(
+			M.config.workspace_update_debounce,
+			0,
+			vim.schedule_wrap(function()
+				M.update_workspace_panel()
+				if workspace_cache.debounce_timer then
+					workspace_cache.debounce_timer:close()
+					workspace_cache.debounce_timer = nil
+				end
+			end)
+		)
 	end
 end
 
 function M.update_workspace_panel()
 	if not is_repl_running() then
-		vim.notify("⚠️  Julia REPL not running", vim.log.levels.WARN)
+		vim.notify("⚠️ Julia REPL not running", vim.log.levels.WARN)
 		return
 	end
 
@@ -446,17 +688,25 @@ function M.update_workspace_panel()
 		return
 	end
 
-	-- Create a temporary Julia script for silent execution
+	local now = vim.loop.now()
+	if M.config.use_cache and workspace_cache.data and (now - workspace_cache.last_update) < M.config.cache_ttl then
+		if vim.api.nvim_buf_is_valid(workspace_bufnr) then
+			vim.bo[workspace_bufnr].modifiable = true
+			vim.api.nvim_buf_set_lines(workspace_bufnr, 0, -1, false, workspace_cache.data)
+			vim.bo[workspace_bufnr].modifiable = false
+		end
+		return
+	end
+
 	local julia_script = vim.fn.stdpath("cache") .. "/__nvim_workspace_update.jl"
 	local julia_code = string.format(
 		[[
-# Workspace introspection script
 const __nvim_ws_path = raw"%s"
 let
     io = open(__nvim_ws_path, "w")
     try
         println(io, "╭─────────────────────────────────────────╮")
-        println(io, "│  jEMach Workspace                        │")
+        println(io, "│  jEMach Workspace                         │")
         println(io, "╰─────────────────────────────────────────╯")
         println(io, "")
 
@@ -525,8 +775,8 @@ let
 
         println(io, "")
         println(io, "╭─────────────────────────────────────────╮")
-        println(io, "│  <CR> print │ i inspect │ d delete     │")
-        println(io, "│  r refresh  │ q close                  │")
+        println(io, "│  <CR> print │ i inspect │ d delete       │")
+        println(io, "│  r refresh  │ q close                   │")
         println(io, "╰─────────────────────────────────────────╯")
     finally
         close(io)
@@ -543,13 +793,8 @@ nothing
 		file:write(julia_code)
 		file:close()
 
-		-- Execute via include (silent in REPL)
 		local cmd = string.format('include(raw"%s")', julia_script)
-		if M.config.terminal_type == "native" then
-			send_to_native_terminal(cmd)
-		else
-			julia_terminal_obj:send(cmd .. "\n")
-		end
+		send_to_backend(cmd)
 	end
 
 	vim.defer_fn(function()
@@ -565,25 +810,27 @@ nothing
 		if #file_content == 0 then
 			file_content = {
 				"╭─────────────────────────────────────────╮",
-				"│  jEMach Workspace                        │",
+				"│  jEMach Workspace                         │",
 				"╰─────────────────────────────────────────╯",
 				"",
 				"  No variables defined",
 			}
 		end
 
+		workspace_cache.data = file_content
+		workspace_cache.last_update = vim.loop.now()
+
 		if vim.api.nvim_buf_is_valid(workspace_bufnr) then
-			vim.api.nvim_buf_set_option(workspace_bufnr, "modifiable", true)
+			vim.bo[workspace_bufnr].modifiable = true
 			vim.api.nvim_buf_set_lines(workspace_bufnr, 0, -1, false, file_content)
-			vim.api.nvim_buf_set_option(workspace_bufnr, "modifiable", false)
+			vim.bo[workspace_bufnr].modifiable = false
 		end
 	end, 500)
 end
 
 local function get_variable_under_cursor()
 	local line = vim.api.nvim_get_current_line()
-	-- Match format: "  name              Type                Value"
-	local var = line:match("^%s+(%S+)%s+%S+%s+")
+	local var = line:match("^%s+(%S+)%s+%S+%s*")
 	return var
 end
 
@@ -591,11 +838,7 @@ local function setup_workspace_keymaps(bufnr)
 	vim.keymap.set("n", "<CR>", function()
 		local var = get_variable_under_cursor()
 		if var and is_repl_running() then
-			if M.config.terminal_type == "native" then
-				send_to_native_terminal(string.format("println(%s)", var))
-			else
-				julia_terminal_obj:send(string.format("println(%s)\n", var))
-			end
+			send_to_backend(string.format("println(%s)", var))
 			vim.notify("📤 println(" .. var .. ")", vim.log.levels.INFO)
 		end
 	end, { buffer = bufnr, desc = "Print variable" })
@@ -603,11 +846,7 @@ local function setup_workspace_keymaps(bufnr)
 	vim.keymap.set("n", "i", function()
 		local var = get_variable_under_cursor()
 		if var and is_repl_running() then
-			if M.config.terminal_type == "native" then
-				send_to_native_terminal(string.format("@show typeof(%s); @show size(%s)", var, var))
-			else
-				julia_terminal_obj:send(string.format("@show typeof(%s); @show size(%s)\n", var, var))
-			end
+			send_to_backend(string.format("@show typeof(%s); @show size(%s)", var, var))
 			vim.notify("🔍 Inspecting: " .. var, vim.log.levels.INFO)
 		end
 	end, { buffer = bufnr, desc = "Inspect variable" })
@@ -617,18 +856,16 @@ local function setup_workspace_keymaps(bufnr)
 		if var and is_repl_running() then
 			local confirm = vim.fn.confirm(string.format("Delete '%s'?", var), "&Yes\n&No", 2)
 			if confirm == 1 then
-				if M.config.terminal_type == "native" then
-					send_to_native_terminal(string.format("%s = nothing", var))
-				else
-					julia_terminal_obj:send(string.format("%s = nothing\n", var))
-				end
-				vim.notify("🗑️  Deleted: " .. var, vim.log.levels.WARN)
+				send_to_backend(string.format("%s = nothing", var))
+				vim.notify("🗑️ Deleted: " .. var, vim.log.levels.WARN)
+				workspace_cache.data = nil
 				vim.defer_fn(M.update_workspace_panel, 400)
 			end
 		end
 	end, { buffer = bufnr, desc = "Delete variable" })
 
 	vim.keymap.set("n", "r", function()
+		workspace_cache.data = nil
 		M.update_workspace_panel()
 		vim.notify("🔄 Refreshed", vim.log.levels.INFO)
 	end, { buffer = bufnr, desc = "Refresh" })
@@ -651,46 +888,46 @@ function M.toggle_workspace_panel()
 	end
 
 	workspace_bufnr = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_option(workspace_bufnr, "buftype", "nofile")
-	vim.api.nvim_buf_set_option(workspace_bufnr, "bufhidden", "hide")
-	vim.api.nvim_buf_set_option(workspace_bufnr, "swapfile", false)
-	vim.api.nvim_buf_set_option(workspace_bufnr, "filetype", "julia")
-	vim.api.nvim_buf_set_option(workspace_bufnr, "modifiable", true)
+	vim.bo[workspace_bufnr].buftype = "nofile"
+	vim.bo[workspace_bufnr].bufhidden = "hide"
+	vim.bo[workspace_bufnr].swapfile = false
+	vim.bo[workspace_bufnr].filetype = "julia"
+	vim.bo[workspace_bufnr].modifiable = true
 	vim.api.nvim_buf_set_lines(workspace_bufnr, 0, -1, false, { "Loading..." })
-	vim.api.nvim_buf_set_option(workspace_bufnr, "modifiable", false)
+	vim.bo[workspace_bufnr].modifiable = false
 
 	vim.cmd("set splitright")
 	vim.cmd(string.format("vsplit | vertical resize %d", M.config.workspace_width))
 
 	workspace_win_id = vim.api.nvim_get_current_win()
 	vim.api.nvim_win_set_buf(workspace_win_id, workspace_bufnr)
-	vim.api.nvim_win_set_option(workspace_win_id, "foldenable", false)
-	vim.api.nvim_win_set_option(workspace_win_id, "spell", false)
-	vim.api.nvim_win_set_option(workspace_win_id, "number", false)
-	vim.api.nvim_win_set_option(workspace_win_id, "relativenumber", false)
-	vim.api.nvim_win_set_option(workspace_win_id, "wrap", false)
-	vim.api.nvim_win_set_option(workspace_win_id, "linebreak", false)
+	vim.wo[workspace_win_id].foldenable = false
+	vim.wo[workspace_win_id].spell = false
+	vim.wo[workspace_win_id].number = false
+	vim.wo[workspace_win_id].relativenumber = false
+	vim.wo[workspace_win_id].wrap = false
+	vim.wo[workspace_win_id].linebreak = false
 
 	setup_workspace_keymaps(workspace_bufnr)
 
 	if is_repl_running() then
 		M.update_workspace_panel()
 	else
-		vim.api.nvim_buf_set_option(workspace_bufnr, "modifiable", true)
+		vim.bo[workspace_bufnr].modifiable = true
 		vim.api.nvim_buf_set_lines(workspace_bufnr, 0, -1, false, {
 			"╭─────────────────────────────────────────╮",
-			"│  jEMach Workspace                        │",
+			"│  jEMach Workspace                         │",
 			"╰─────────────────────────────────────────╯",
 			"",
 			"  Start REPL first:",
 			"    :Jr or <leader>jw",
 			"",
 			"╭─────────────────────────────────────────╮",
-			"│  <CR> print │ i inspect │ d delete     │",
-			"│  r refresh  │ q close                  │",
+			"│  <CR> print │ i inspect │ d delete       │",
+			"│  r refresh  │ q close                   │",
 			"╰─────────────────────────────────────────╯",
 		})
-		vim.api.nvim_buf_set_option(workspace_bufnr, "modifiable", false)
+		vim.bo[workspace_bufnr].modifiable = false
 	end
 end
 
@@ -736,14 +973,10 @@ function M.show_history()
 					actions.close(prompt_bufnr)
 					local selection = action_state.get_selected_entry()
 					if selection and is_repl_running() then
-						if M.config.terminal_type == "native" then
-							send_to_native_terminal(selection.value)
-						else
-							julia_terminal_obj:send(selection.value .. "\n")
-						end
+						send_to_backend(selection.value)
 						vim.notify("📤 Sent from history", vim.log.levels.INFO)
 					elseif selection then
-						vim.notify("⚠️  REPL not running", vim.log.levels.WARN)
+						vim.notify("⚠️ REPL not running", vim.log.levels.WARN)
 					end
 				end)
 				return true
@@ -786,13 +1019,183 @@ function M.cycle_terminal_direction()
 	M.set_terminal_direction(directions[next_idx])
 end
 
--- Focus management functions
+function M.save_workspace()
+	if not is_repl_running() then
+		vim.notify("⚠️ Julia REPL not running", vim.log.levels.WARN)
+		return
+	end
+
+	local save_code = string.format(
+		[[
+using Serialization
+const __nvim_save_path = raw"%s"
+const __nvim_excluded = [:Main, :Core, :Base, :__nvim_save_path, :__nvim_excluded]
+
+function __save_workspace()
+    workspace_data = Dict{Symbol, Any}()
+
+    all_names = names(Main, all=true)
+    for name in all_names
+        str_name = string(name)
+        if !startswith(str_name, "#") &&
+           !startswith(str_name, "__nvim") &&
+           !(name in __nvim_excluded)
+            try
+                val = getfield(Main, name)
+                # Only save serializable types (exclude Modules and Functions)
+                if !(val isa Module) && !(val isa Function)
+                    workspace_data[name] = val
+                end
+            catch e
+                @warn "Could not save variable: $name" exception=e
+            end
+        end
+    end
+
+    try
+        open(__nvim_save_path, "w") do io
+            serialize(io, workspace_data)
+        end
+        println("✅ Workspace saved ($(length(workspace_data)) variables)")
+        return true
+    catch e
+        @error "Failed to save workspace" exception=e
+        return false
+    end
+end
+
+__save_workspace()
+]],
+		workspace_save_file
+	)
+
+	send_to_backend(save_code)
+	vim.notify("💾 Saving workspace...", vim.log.levels.INFO)
+end
+
+function M.restore_workspace()
+	if not is_repl_running() then
+		vim.notify("⚠️ Julia REPL not running", vim.log.levels.WARN)
+		return
+	end
+
+	if vim.fn.filereadable(workspace_save_file) ~= 1 then
+		vim.notify("📭 No saved workspace found", vim.log.levels.WARN)
+		return
+	end
+
+	local restore_code = string.format(
+		[[
+using Serialization
+const __nvim_restore_path = raw"%s"
+
+function __restore_workspace()
+    if !isfile(__nvim_restore_path)
+        println("❌ No workspace file found")
+        return false
+    end
+
+    try
+        workspace_data = open(__nvim_restore_path, "r") do io
+            deserialize(io)
+        end
+
+        count = 0
+        for (name, val) in workspace_data
+            try
+                # Validate name is a valid Symbol and not trying to override Core/Base
+                if name isa Symbol && !startswith(string(name), "#") &&
+                   !(name in [:Main, :Core, :Base])
+                    setfield!(Main, name, val)
+                    count += 1
+                end
+            catch e
+                @warn "Could not restore variable: $name" exception=e
+            end
+        end
+
+        println("✅ Workspace restored ($count variables)")
+        return true
+    catch e
+        @error "Failed to restore workspace" exception=e
+        return false
+    end
+end
+
+__restore_workspace()
+]],
+		workspace_save_file
+	)
+
+	send_to_backend(restore_code)
+	vim.notify("📂 Restoring workspace...", vim.log.levels.INFO)
+
+	if M.config.auto_update_workspace and workspace_bufnr and vim.api.nvim_buf_is_valid(workspace_bufnr) then
+		vim.defer_fn(M.update_workspace_panel, 1000)
+	end
+end
+
+function M.clear_saved_workspace()
+	if vim.fn.filereadable(workspace_save_file) ~= 1 then
+		vim.notify("📭 No saved workspace found", vim.log.levels.INFO)
+		return
+	end
+
+	local confirm = vim.fn.confirm("Clear saved workspace?", "&Yes\n&No", 2)
+	if confirm == 1 then
+		os.remove(workspace_save_file)
+		vim.notify("🗑️ Saved workspace cleared", vim.log.levels.INFO)
+	end
+end
+
+function M.set_backend(backend)
+	local valid_backends = { "toggleterm", "vim-slime", "auto" }
+	if not vim.tbl_contains(valid_backends, backend) then
+		vim.notify("❌ Invalid backend. Use: toggleterm, vim-slime, or auto", vim.log.levels.ERROR)
+		return
+	end
+
+	if backend == "auto" then
+		M.config.backend = detect_backend()
+		vim.notify("🔍 Auto-detected backend: " .. M.config.backend, vim.log.levels.INFO)
+	else
+		M.config.backend = backend
+		vim.notify("🔧 Backend set to: " .. backend, vim.log.levels.INFO)
+	end
+
+	-- Clear cache when switching backends
+	workspace_cache.data = nil
+end
+
+function M.show_backend()
+	local backend = get_active_backend()
+	local backend_info = {
+		"Current REPL Backend: " .. backend,
+		"",
+		"Available backends:",
+		"  • toggleterm - Internal terminal (requires toggleterm.nvim)",
+		"  • vim-slime  - External REPL via tmux/screen (requires vim-slime)",
+		"  • auto       - Auto-detect based on installed plugins",
+	}
+
+	if backend == "vim-slime" then
+		table.insert(backend_info, "")
+		table.insert(backend_info, "vim-slime config:")
+		table.insert(backend_info, "  target: " .. M.config.slime_target)
+		if M.config.slime_target == "tmux" then
+			table.insert(backend_info, "  socket: " .. (M.config.slime_default_config.socket_name or "default"))
+			table.insert(backend_info, "  pane: " .. (M.config.slime_default_config.target_pane or "{right-of}"))
+		end
+	end
+
+	vim.notify(table.concat(backend_info, "\n"), vim.log.levels.INFO)
+end
+
 local function save_code_window()
 	local current_win = vim.api.nvim_get_current_win()
 	local bufnr = vim.api.nvim_win_get_buf(current_win)
 	local buftype = vim.api.nvim_get_option_value("buftype", { buf = bufnr })
 
-	-- Save if it's a normal buffer (not terminal or special buffer)
 	if buftype == "" then
 		last_code_win = current_win
 	end
@@ -819,7 +1222,7 @@ end
 
 function M.focus_repl()
 	if not is_repl_running() then
-		vim.notify("⚠️  Julia REPL not running. Starting...", vim.log.levels.WARN)
+		vim.notify("⚠️ Julia REPL not running. Starting...", vim.log.levels.WARN)
 		M.toggle_repl()
 		return
 	end
@@ -830,8 +1233,7 @@ function M.focus_repl()
 	if repl_win then
 		vim.api.nvim_set_current_win(repl_win)
 		vim.notify("🎯 REPL focused", vim.log.levels.INFO)
-	else
-		-- REPL might be hidden, toggle it
+	elseif M.config.terminal_type ~= "native" then -- Only toggleterm can be "hidden"
 		julia_terminal_obj:toggle()
 		vim.defer_fn(function()
 			local new_repl_win = get_repl_window()
@@ -844,7 +1246,7 @@ end
 
 function M.focus_workspace()
 	if not workspace_win_id or not vim.api.nvim_win_is_valid(workspace_win_id) then
-		vim.notify("⚠️  Workspace panel not open. Opening...", vim.log.levels.WARN)
+		vim.notify("⚠️ Workspace panel not open. Opening...", vim.log.levels.WARN)
 		M.toggle_workspace_panel()
 		return
 	end
@@ -870,7 +1272,7 @@ function M.focus_code()
 				return
 			end
 		end
-		vim.notify("⚠️  No code buffer found", vim.log.levels.WARN)
+		vim.notify("⚠️ No code buffer found", vim.log.levels.WARN)
 	end
 end
 
@@ -896,24 +1298,21 @@ function M.cycle_focus()
 		elseif workspace_win_id and vim.api.nvim_win_is_valid(workspace_win_id) then
 			M.focus_workspace()
 		else
-			vim.notify("⚠️  No Julia components active", vim.log.levels.WARN)
+			vim.notify("⚠️ No Julia components active", vim.log.levels.WARN)
 		end
 	end
 end
 
--- Helper function to create workspace buffer
 local function create_workspace_buffer()
 	workspace_bufnr = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_option(workspace_bufnr, "buftype", "nofile")
-	vim.api.nvim_buf_set_option(workspace_bufnr, "bufhidden", "hide")
-	vim.api.nvim_buf_set_option(workspace_bufnr, "swapfile", false)
-	vim.api.nvim_buf_set_option(workspace_bufnr, "filetype", "julia")
+	vim.bo[workspace_bufnr].buftype = "nofile"
+	vim.bo[workspace_bufnr].bufhidden = "hide"
+	vim.bo[workspace_bufnr].swapfile = false
+	vim.bo[workspace_bufnr].filetype = "julia"
 end
 
--- Unified workflow mode
 function M.toggle_workflow_mode()
 	if workflow_mode_active then
-		-- Close workflow mode
 		if workspace_win_id and vim.api.nvim_win_is_valid(workspace_win_id) then
 			vim.api.nvim_win_close(workspace_win_id, true)
 			workspace_win_id = nil
@@ -932,17 +1331,12 @@ function M.toggle_workflow_mode()
 		workflow_mode_active = false
 		vim.notify("📴 Workflow mode deactivated", vim.log.levels.INFO)
 	else
-		-- Activate workflow mode
 		workflow_mode_active = true
 		vim.notify("📡 Activating Julia Workflow...", vim.log.levels.INFO)
 
-		-- Save current window as code window
 		save_code_window()
 
 		if M.config.layout_mode == "vertical_split" then
-			-- Layout: Terminal on right, workspace underneath
-
-			-- Step 1: Open terminal on right
 			local bufnr, cmd
 			if not is_repl_running() then
 				bufnr, cmd = start_native_terminal()
@@ -956,10 +1350,13 @@ function M.toggle_workflow_mode()
 				open_terminal_in_window(bufnr, cmd)
 			else
 				vim.api.nvim_win_set_buf(terminal_win_id, bufnr)
+				-- Setup monitor for existing terminal
+				vim.defer_fn(function()
+					setup_repl_monitor(bufnr)
+				end, 100)
 			end
 			vim.cmd("wincmd L")
 
-			-- Step 2: Split terminal window horizontally for workspace
 			vim.defer_fn(function()
 				if terminal_win_id and vim.api.nvim_win_is_valid(terminal_win_id) then
 					vim.api.nvim_set_current_win(terminal_win_id)
@@ -969,8 +1366,8 @@ function M.toggle_workflow_mode()
 					vim.cmd("split")
 					workspace_win_id = vim.api.nvim_get_current_win()
 					vim.api.nvim_win_set_buf(workspace_win_id, workspace_bufnr)
-					vim.api.nvim_win_set_option(workspace_win_id, "wrap", false)
-					vim.api.nvim_win_set_option(workspace_win_id, "number", false)
+					vim.wo[workspace_win_id].wrap = false
+					vim.wo[workspace_win_id].number = false
 
 					setup_workspace_keymaps(workspace_bufnr)
 
@@ -986,8 +1383,6 @@ function M.toggle_workflow_mode()
 				end
 			end, 200)
 		elseif M.config.layout_mode == "unified_buffer" then
-			-- Layout: Single buffer split - REPL top, workspace bottom
-
 			local bufnr, cmd
 			if not is_repl_running() then
 				bufnr, cmd = start_native_terminal()
@@ -1001,6 +1396,10 @@ function M.toggle_workflow_mode()
 				open_terminal_in_window(bufnr, cmd)
 			else
 				vim.api.nvim_win_set_buf(terminal_win_id, bufnr)
+				-- Setup monitor for existing terminal
+				vim.defer_fn(function()
+					setup_repl_monitor(bufnr)
+				end, 100)
 			end
 			vim.cmd("wincmd L")
 
@@ -1013,8 +1412,8 @@ function M.toggle_workflow_mode()
 					vim.cmd("split")
 					workspace_win_id = vim.api.nvim_get_current_win()
 					vim.api.nvim_win_set_buf(workspace_win_id, workspace_bufnr)
-					vim.api.nvim_win_set_option(workspace_win_id, "wrap", false)
-					vim.api.nvim_win_set_option(workspace_win_id, "number", false)
+					vim.wo[workspace_win_id].wrap = false
+					vim.wo[workspace_win_id].number = false
 
 					setup_workspace_keymaps(workspace_bufnr)
 
@@ -1030,7 +1429,6 @@ function M.toggle_workflow_mode()
 				end
 			end, 200)
 		else
-			-- Original layout: workspace on right, REPL at bottom
 			if not workspace_win_id or not vim.api.nvim_win_is_valid(workspace_win_id) then
 				M.toggle_workspace_panel()
 			end
@@ -1060,7 +1458,6 @@ end
 function M.setup_global_keybindings()
 	local kb = M.config.keybindings
 
-	-- Focus management keybindings
 	vim.keymap.set("n", kb.focus_repl, M.focus_repl, { desc = "Focus Julia REPL", noremap = true, silent = true })
 	vim.keymap.set(
 		"n",
@@ -1082,7 +1479,6 @@ function M.setup_global_keybindings()
 		{ desc = "Toggle Julia Workflow Mode", noremap = true, silent = true }
 	)
 
-	-- Also make toggle_repl available from normal mode
 	vim.keymap.set("n", kb.toggle_repl, M.toggle_repl, { desc = "Toggle Julia REPL", noremap = true, silent = true })
 
 	vim.keymap.set("t", kb.toggle_repl, function()
@@ -1098,8 +1494,6 @@ function M.setup_global_keybindings()
 		vim.schedule(M.cycle_focus)
 	end, { desc = "Cycle Julia components", noremap = true, silent = true })
 end
-
--- Lualine integration
 function M.get_focus_component()
 	if not workflow_mode_active then
 		return ""
@@ -1115,13 +1509,15 @@ function M.get_focus_component()
 	if current_win == repl_win then
 		return "󰨞 REPL"
 	elseif current_win == workspace_win_id then
-		return " Workspace"
+		return "workspace"
 	else
 		local ok, bufnr = pcall(vim.api.nvim_win_get_buf, current_win)
 		if ok and bufnr then
-			local buftype_ok, buftype = pcall(vim.api.nvim_buf_get_option, bufnr, "buftype")
+			local buftype_ok, buftype = pcall(function()
+				return vim.bo[bufnr].buftype
+			end)
 			if buftype_ok and buftype == "" then
-				return " Code"
+				return "Code"
 			end
 		end
 	end
@@ -1134,8 +1530,7 @@ function M.setup_lualine()
 	if not ok then
 		return
 	end
-	-- still working on
-	-- Add julia_focus component to lualine
+
 	local config = lualine.get_config()
 	if config.sections and config.sections.lualine_x then
 		local colors = M.config.lualine_colors or {}
