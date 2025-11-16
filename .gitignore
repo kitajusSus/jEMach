@@ -1,0 +1,71 @@
+# Neovim cache files
+*.log
+
+
+# Julia workspace persistence files (user-specific)
+julia_workspace_save.jl
+
+# System files
+.DS_Store
+
+# Test files
+test/
+*.test.jl
+
+# Temporary files
+*.tmp
+
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+
+# Node.js / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Zig build artifacts
+zig/zig-cache/
+zig/zig-out/
+zig/.zig-cache/
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Build artifacts
+# *.so
+# *.dylib
+# *.dll
+# *.a
+# *.lib
+# *.o
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+
+# Build artifacts
+node_modules/
+dist/
+*.o
+native/build/
+lib/
+# Native modules are built locally with available compiler (zig c++, clang++, or g++)
+.zig-cache/
+zig-out/
+
+# Package manager files
+package-lock.json
+bun.lockb
+yarn.lock
