@@ -1,5 +1,5 @@
 # jemach
-![jemachpic.png]
+![jemachpic.png](jemachpic.png)
 
 
 A comprehensive Neovim plugin for Julia development with an integrated REPL, workspace panel, and unified workflow mode for fast and efficient coding.
