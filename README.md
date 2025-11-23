@@ -127,6 +127,13 @@ The workspace panel shows a list of variables.
 - **Summary**: Shows the value (for simple types) or dimensions/structure (for complex types).
 - **Inspector**: Press `i` on a variable to see full details, documentation, and method signatures.
 
-## License
 
-MIT
+
+# credits
+
+
+- *My Dad and My Mum*
+- My future wife
+- Built with [toggleterm.nvim](https://github.com/akinsho/toggleterm.nvim)
+- Uses [vim-slime](https://github.com/jpalardy/vim-slime) for tmux integration
+- tmux *everybody knows what tmux is*
