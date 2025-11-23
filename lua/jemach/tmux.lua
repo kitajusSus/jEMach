@@ -1,235 +1,360 @@
 local M = {}
 
+-- State
+local state = {
+    pane_id = nil,
+    inspector_pane_id = nil,
+    last_nvim_pane = nil
+}
+
 function M.is_available()
-	return vim.fn.executable("tmux") == 1 and vim.env.TMUX ~= nil
+    return vim.fn.executable("tmux") == 1 and vim.env.TMUX ~= nil
 end
-function M.get_session_id()
-	if not M.is_available() then
-		return nil
-	end
 
-	local handle = io.popen('tmux display-message -p "#{session_id}"')
-	if not handle then
-		return nil
-	end
+function M.is_running()
+    if not state.pane_id then
+        -- Try to rediscover if we have a known session
+        local session_name = "jemach_repl"
+        local handle = io.popen("tmux list-panes -t " .. session_name .. " -F '#{pane_id}' 2>/dev/null")
+        if handle then
+            local pid = handle:read("*l")
+            handle:close()
+            if pid then
+                state.pane_id = pid
+                return true
+            end
+        end
 
-	local result = handle:read("*l")
-	handle:close()
-	return result
+        -- Fallback: Look for any pane running julia
+        local julia_panes = M.find_julia_panes()
+        if #julia_panes > 0 then
+            state.pane_id = julia_panes[1].id
+            return true
+        end
+        return false
+    end
+
+    -- Verify it still exists AND is actually running Julia
+    -- We fetch both ID and command to ensure we don't attach to a shell
+    local handle = io.popen("tmux list-panes -a -F '#{pane_id}:#{pane_current_command}'")
+    if handle then
+        local found = false
+        for line in handle:lines() do
+            local id, cmd = line:match("([^:]+):(.+)")
+            if id == state.pane_id then
+                -- Check if the command is still julia
+                if cmd and cmd:lower():find("julia", 1, true) then
+                    found = true
+                else
+                    -- Pane exists but not running julia (e.g. dropped to shell)
+                    found = false
+                end
+                break
+            end
+        end
+        handle:close()
+
+        if found then
+            return true
+        end
+    end
+
+    state.pane_id = nil
+    return false
 end
+
+-- Utility: Get current nvim pane
+function M.get_current_tmux_pane()
+    local handle = io.popen('tmux display-message -p "#{pane_id}"')
+    if handle then
+        local id = handle:read("*l")
+        handle:close()
+        return id
+    end
+    return nil
+end
+
+-- Utility: List panes
 function M.list_panes()
-	if not M.is_available() then
-		return {}
-	end
+    if not M.is_available() then return {} end
+    local handle = io.popen('tmux list-panes -a -F "#{pane_id}:#{pane_current_command}:#{pane_title}"')
+    if not handle then return {} end
 
-	local handle =
-		io.popen('tmux list-panes -F "#{pane_id}:#{pane_index}:#{pane_active}:#{pane_current_command}:#{pane_title}"')
-	if not handle then
-		return {}
-	end
-
-	local panes = {}
-	for line in handle:lines() do
-		local id, index, active, command, title = line:match("([^:]+):([^:]+):([^:]+):([^:]+):(.+)")
-		if id then
-			table.insert(panes, {
-				id = id,
-				index = tonumber(index),
-				active = active == "1",
-				command = command,
-				title = title,
-			})
-		end
-	end
-	handle:close()
-
-	return panes
+    local panes = {}
+    for line in handle:lines() do
+        local id, cmd, title = line:match("([^:]+):([^:]+):(.+)")
+        if id then
+            table.insert(panes, {id=id, command=cmd, title=title})
+        end
+    end
+    handle:close()
+    return panes
 end
+
 function M.find_julia_panes()
-	local panes = M.list_panes()
-	local julia_panes = {}
-
-	for _, pane in ipairs(panes) do
-		local cmd_lower = pane.command:lower()
-		local title_lower = pane.title:lower()
-
-		if cmd_lower:find("julia") or title_lower:find("julia") then
-			table.insert(julia_panes, pane)
-		end
-	end
-
-	return julia_panes
-end
-function M.get_or_create_julia_pane(opts)
-	opts = opts or {}
-	local prefer_existing = opts.prefer_existing ~= false
-
-	if prefer_existing then
-		local julia_panes = M.find_julia_panes()
-		if #julia_panes > 0 then
-			return julia_panes[1].id
-		end
-	end
-
-	return M.create_julia_pane(opts)
+    local panes = M.list_panes()
+    local julia_panes = {}
+    local current_pane = M.get_current_tmux_pane()
+    for _, pane in ipairs(panes) do
+        if pane.id ~= current_pane then
+            -- Strict check: ONLY trust the command, not the title.
+            -- This prevents attaching to shells in windows named "Julia REPL"
+            if pane.command:lower():find("julia", 1, true) then
+                table.insert(julia_panes, pane)
+            end
+        end
+    end
+    return julia_panes
 end
 
-function M.create_julia_pane(opts)
-	if not M.is_available() then
-		vim.notify("Not in a tmux session", vim.log.levels.ERROR)
-		return nil
-	end
+function M.start(cmd, opts)
+    if not M.is_available() then
+        vim.notify("Tmux not found or not in a session", vim.log.levels.ERROR)
+        return false
+    end
 
-	opts = opts or {}
-	local direction = opts.direction or "horizontal"
-	local size = opts.size or 15
+    local isolation = opts.isolation or "window"
 
-	local split_flag = direction == "horizontal" and "-v" or "-h"
-	local cmd = string.format("tmux split-window %s -l %d julia", split_flag, size)
+    if M.is_running() then
+        local current = M.get_current_tmux_pane()
+        if state.pane_id == current then
+             state.pane_id = nil
+        else
+             vim.notify("Julia pane already detected: " .. state.pane_id, vim.log.levels.INFO)
+             return true
+        end
+    end
 
-	local success = vim.fn.system(cmd)
-	if vim.v.shell_error ~= 0 then
-		vim.notify("Failed to create Julia pane: " .. success, vim.log.levels.ERROR)
-		return nil
-	end
+    if isolation == "pane" then
+        local existing = M.find_julia_panes()
+        if #existing > 0 then
+            state.pane_id = existing[1].id
+            vim.notify("Attached to existing Julia pane: " .. state.pane_id, vim.log.levels.INFO)
+            return true
+        end
+    end
 
-	local handle = io.popen('tmux display-message -p "#{pane_id}"')
-	if not handle then
-		return nil
-	end
+    local nvim_pane = M.get_current_tmux_pane()
 
-	local pane_id = handle:read("*l")
-	handle:close()
+    if isolation == "session" then
+        local session_name = "jemach_repl"
+        local check = os.execute("tmux has-session -t " .. session_name .. " 2>/dev/null")
+        if check == 0 then
+            local handle = io.popen("tmux list-panes -t " .. session_name .. " -F '#{pane_id}'")
+            if handle then
+                local pid = handle:read("*l")
+                handle:close()
+                if pid then
+                    state.pane_id = pid
+                    vim.notify("Attached to existing session: " .. session_name, vim.log.levels.INFO)
+                    return true
+                end
+            end
+            vim.notify("Failed to find pane in existing session " .. session_name, vim.log.levels.ERROR)
+        else
+            local ret = os.execute("tmux new-session -d -s " .. session_name .. " '" .. cmd .. "'")
+            vim.loop.sleep(100)
 
-	return pane_id
+            local handle = io.popen("tmux list-panes -t " .. session_name .. " -F '#{pane_id}'")
+            if handle then
+                local pid = handle:read("*l")
+                handle:close()
+                if pid then
+                    state.pane_id = pid
+                    vim.notify("Started Julia in new session: " .. session_name, vim.log.levels.INFO)
+                    return true
+                end
+            end
+            vim.notify("❌ Failed to create/find tmux session: " .. session_name .. ". Check tmux logs.", vim.log.levels.ERROR)
+        end
+        return false
+
+    elseif isolation == "window" then
+        local tmux_cmd = string.format("tmux new-window -P -n 'Julia REPL' -F '#{pane_id}' '%s'", cmd)
+        local handle = io.popen(tmux_cmd)
+        if handle then
+            local new_id = handle:read("*l")
+            handle:close()
+            if new_id then
+                state.pane_id = new_id
+                vim.notify("Started Julia in new window: " .. new_id, vim.log.levels.INFO)
+
+                -- Optional: Attach workspace viewer in a split
+                if opts.attach_workspace then
+                    local ws_file = vim.fn.stdpath("cache") .. "/jemach.log"
+                    -- Create dummy file if not exists
+                    local f = io.open(ws_file, "a"); if f then f:close() end
+
+                    local split_flag = "-h"
+                    if opts.workspace_layout == "horizontal" then split_flag = "-v" end
+
+                    -- We want to run a command that displays the log cleanly.
+                    -- Simple `tail -f` for now. `column` is nice but requires complex piping.
+                    -- Let's try to format it slightly with awk if possible, else just cat.
+                    -- Safest is tail -f.
+                    local viewer_cmd = string.format("tail -n 100 -f %s", vim.fn.shellescape(ws_file))
+
+                    -- Split the NEW window (target new_id)
+                    -- We need to target the pane ID we just got.
+                    local split_cmd = string.format("tmux split-window %s -l 40 -t %s '%s'", split_flag, new_id, viewer_cmd)
+                    os.execute(split_cmd)
+
+                    -- Rename the pane for clarity?
+                    -- We need the ID of the new pane. split-window -P -F '#{pane_id}'
+                    -- But let's just assume it worked.
+                    -- Also, select the REPL pane back so focus is on REPL.
+                    os.execute("tmux select-pane -t " .. new_id)
+                end
+
+                return true
+            end
+        end
+        vim.notify("❌ Failed to create tmux window.", vim.log.levels.ERROR)
+
+    else -- pane
+        local direction = opts.direction or "horizontal"
+        local size = opts.size or 15
+        local split_flag = (direction == "vertical") and "-h" or "-v"
+        if direction == "vertical" then split_flag = "-h" else split_flag = "-v" end
+
+        local tmux_cmd = string.format("tmux split-window %s -l %d -P -F '#{pane_id}' '%s'", split_flag, size, cmd)
+        local handle = io.popen(tmux_cmd)
+        if handle then
+            local new_id = handle:read("*l")
+            handle:close()
+            if new_id then
+                state.pane_id = new_id
+                vim.notify("Started Julia in split pane: " .. new_id, vim.log.levels.INFO)
+                if nvim_pane then
+                    os.execute("tmux select-pane -t " .. nvim_pane)
+                end
+                return true
+            end
+        end
+        vim.notify("❌ Failed to split tmux pane.", vim.log.levels.ERROR)
+    end
+
+    return false
 end
-function M.send_to_pane(pane_id, code)
-	if not M.is_available() then
-		return false
-	end
 
-	local escaped = code:gsub("'", "'\\''")
+function M.send(text)
+    local current_pane = M.get_current_tmux_pane()
 
-	local cmd = string.format("tmux send-keys -t %s '%s' Enter", pane_id, escaped)
-	local result = vim.fn.system(cmd)
+    if not state.pane_id then
+        vim.notify("❌ No Julia pane targeted. Please run :Jr or restart plugin.", vim.log.levels.ERROR)
+        return false
+    end
 
-	return vim.v.shell_error == 0
+    if state.pane_id == current_pane then
+        vim.notify("❌ Critical: Plugin attempted to paste into editor! Aborting send.", vim.log.levels.ERROR)
+        state.pane_id = nil
+        return false
+    end
+
+    if not M.is_running() then
+        vim.notify("❌ Julia pane not found (or not running Julia).", vim.log.levels.ERROR)
+        return false
+    end
+
+    local tfile = vim.fn.tempname()
+    local f2 = io.open(tfile, "w")
+    if f2 then
+        f2:write(text)
+        if text:sub(-1) ~= "\n" then f2:write("\n") end
+        f2:close()
+
+        local escaped_tfile = vim.fn.shellescape(tfile)
+
+        vim.fn.system(string.format("tmux load-buffer %s", escaped_tfile))
+        vim.fn.system(string.format("tmux paste-buffer -d -t %s", state.pane_id))
+
+        os.remove(tfile)
+        return true
+    end
+
+    return false
 end
-function M.capture_pane(pane_id, lines)
-	if not M.is_available() then
-		return ""
-	end
 
-	lines = lines or 100
-	local cmd = string.format("tmux capture-pane -t %s -p -S -%d", pane_id, lines)
+function M.show(direction)
+    if not M.is_running() then return end
 
-	local handle = io.popen(cmd)
-	if not handle then
-		return ""
-	end
+    local handle = io.popen("tmux display-message -p -t " .. state.pane_id .. " '#{session_name}'")
+    local target_session = handle:read("*l")
+    handle:close()
 
-	local content = handle:read("*a")
-	handle:close()
+    local handle2 = io.popen("tmux display-message -p '#{session_name}'")
+    local current_session = handle2:read("*l")
+    handle2:close()
 
-	return content
+    if target_session ~= current_session then
+        if vim.env.TMUX then
+             vim.notify("🔄 Switching to session '".. target_session .."'...", vim.log.levels.INFO)
+             os.execute("tmux switch-client -t " .. target_session)
+        else
+             vim.notify("Julia is running in detached session '".. (target_session or "?") .."'. Attach tmux to view.", vim.log.levels.INFO)
+        end
+    else
+        os.execute("tmux select-pane -t " .. state.pane_id)
+    end
 end
-function M.focus_pane(pane_id)
-	if not M.is_available() then
-		return false
-	end
 
-	local cmd = string.format("tmux select-pane -t %s", pane_id)
-	local result = vim.fn.system(cmd)
-
-	return vim.v.shell_error == 0
+function M.hide()
+    local current = M.get_current_tmux_pane()
+    if current then
+        state.last_nvim_pane = current
+    end
 end
-function M.setup_workspace(opts)
-	if not M.is_available() then
-		vim.notify("tmux is not available or not in a tmux session", vim.log.levels.ERROR)
-		return false
-	end
 
-	opts = opts or {}
-	local layout = opts.layout or "horizontal"
-
-	if layout == "horizontal" then
-		vim.fn.system("tmux split-window -v -p 30")
-	elseif layout == "vertical" then
-		vim.fn.system("tmux split-window -h -p 50")
-	elseif layout == "grid" then
-		vim.fn.system("tmux split-window -v -p 50")
-		vim.fn.system("tmux split-window -h -p 50")
-		vim.fn.system("tmux select-pane -t 0")
-		vim.fn.system("tmux split-window -h -p 50")
-	end
-
-	if vim.v.shell_error == 0 then
-		vim.notify("Julia workspace setup complete", vim.log.levels.INFO)
-		return true
-	else
-		vim.notify("Failed to setup workspace", vim.log.levels.ERROR)
-		return false
-	end
+function M.toggle(direction)
+    M.show()
 end
-function M.get_current_pane()
-	if not M.is_available() then
-		return nil
-	end
 
-	local handle = io.popen('tmux display-message -p "#{pane_id}:#{pane_index}:#{pane_current_command}"')
-	if not handle then
-		return nil
-	end
-
-	local line = handle:read("*l")
-	handle:close()
-
-	if not line then
-		return nil
-	end
-
-	local id, index, command = line:match("([^:]+):([^:]+):(.+)")
-	return {
-		id = id,
-		index = tonumber(index),
-		command = command,
-	}
+function M.get_window()
+    return nil
 end
-function M.quick_send(code, opts)
-	opts = opts or {}
 
-	local pane_id = M.get_or_create_julia_pane(opts)
-	if not pane_id then
-		return false
-	end
+-- --- Inspector Pane Support ---
 
-	return M.send_to_pane(pane_id, code)
+function M.ensure_inspector_pane()
+    if state.inspector_pane_id then
+        local handle = io.popen("tmux display-message -p -t " .. state.inspector_pane_id .. " '#{pane_id}' 2>/dev/null")
+        if handle then
+            local pid = handle:read("*l")
+            handle:close()
+            if pid then return pid end
+        end
+    end
+
+    local inspect_file = vim.fn.stdpath("cache") .. "/jemach_inspect.log"
+    local f = io.open(inspect_file, "a"); if f then f:close() end
+
+    local cmd = string.format("tail -F %s", vim.fn.shellescape(inspect_file))
+    local tmux_cmd = string.format("tmux split-window -h -l 40 -P -F '#{pane_id}' '%s'", cmd)
+
+    local handle = io.popen(tmux_cmd)
+    if handle then
+        local pid = handle:read("*l")
+        handle:close()
+        if pid then
+            state.inspector_pane_id = pid
+            os.execute("tmux select-pane -t " .. pid .. " -T 'jEMach Inspector'")
+            local nvim = M.get_current_tmux_pane()
+            if nvim then os.execute("tmux select-pane -t " .. nvim) end
+            return pid
+        end
+    end
+    return nil
 end
-function M.show_status()
-	if not M.is_available() then
-		vim.notify("tmux is not available", vim.log.levels.WARN)
-		return
-	end
 
-	local session_id = M.get_session_id()
-	local panes = M.list_panes()
-	local julia_panes = M.find_julia_panes()
+function M.open_inspector_pane()
+    M.ensure_inspector_pane()
+end
 
-	local msg = string.format(
-		"tmux Status:\n  Session: %s\n  Total panes: %d\n  Julia panes: %d",
-		session_id or "N/A",
-		#panes,
-		#julia_panes
-	)
-
-	if #julia_panes > 0 then
-		msg = msg .. "\n\nJulia panes:"
-		for _, pane in ipairs(julia_panes) do
-			msg = msg .. string.format("\n  - %s (%s)", pane.id, pane.command)
-		end
-	end
-
-	vim.notify(msg, vim.log.levels.INFO)
+function M.close_inspector_pane()
+    if state.inspector_pane_id then
+        os.execute("tmux kill-pane -t " .. state.inspector_pane_id)
+        state.inspector_pane_id = nil
+    end
 end
 
 return M
