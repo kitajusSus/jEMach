@@ -14,18 +14,50 @@ More info: [Reddit Discussion](https://www.reddit.com/r/Julia/s/keFuc7dhnV)
 A standalone terminal UI for monitoring your Julia REPL session from a side tmux pane —
 no Neovim required, no external Julia packages needed.
 
-### Quick start
+### Quick Start (One-Liner split - Recommended)
 
-```bash
-# 1. In one tmux pane, start Julia:
-julia --project=.
+If you are already in the terminal where you want to run the workspace:
 
-# 2. In the Julia REPL, load the background watcher:
-julia> include("scripts/jl_watcher.jl")
+1. **Split the window and run the TUI** with a single command:
+   ```bash
+   # If running from the cloned repository:
+   tmux split-window -h -l 60 "./scripts/jl-assist"
 
-# 3. In any other pane, launch the TUI:
-./scripts/jl-assist
-```
+   # Or if installed via Neovim package manager:
+   tmux split-window -h -l 60 "~/.local/share/nvim/site/pack/core/opt/jemach/scripts/jl-assist"
+   ```
+2. **Start Julia** in the left (original) pane:
+   ```bash
+   julia -t auto --project=.
+   ```
+3. **Load the watcher** in the Julia REPL:
+   ```julia
+   # If running from the repository:
+   include("scripts/jl_watcher.jl")
+
+   # Or if installed via Neovim (Note: Julia's include() doesn't expand '~', so use homedir()):
+   include(joinpath(homedir(), ".local/share/nvim/site/pack/core/opt/jemach/scripts/jl_watcher.jl"))
+   ```
+
+### Quick Start (Manual Setup)
+
+1. **Start Julia** in your tmux pane:
+   ```bash
+   julia -t auto --project=.
+   ```
+2. **Load the background watcher** in the Julia REPL:
+   ```julia
+   include("scripts/jl_watcher.jl")
+   # Or using the absolute path with homedir() if needed (see above)
+   ```
+3. **Split your tmux window** vertically (e.g. press your tmux prefix, usually `Ctrl+b`, then `%`) and launch the TUI in the new pane:
+   ```bash
+   # From repository:
+   ./scripts/jl-assist
+
+   # Or if installed via Neovim:
+   ~/.local/share/nvim/site/pack/core/opt/jemach/scripts/jl-assist
+   ```
 
 The TUI opens in a new split to the right. It polls the state file every **1.5 s**;
 the Julia watcher writes the file every **2 s** — so changes appear within ~3.5 s.

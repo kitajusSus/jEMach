@@ -123,6 +123,11 @@ function M.setup_repl_monitor(bufnr)
 			local last_lines = vim.api.nvim_buf_get_lines(bufnr, math.max(0, line_count - 3), line_count, false)
 			local last_text = table.concat(last_lines, "\n")
 
+			-- Zapobieganie pętli sprzężenia zwrotnego (ignorujemy własny skrypt odpytywania)
+			if last_text:find("jemach_workspace") then
+				return
+			end
+
 			-- Check if Julia prompt is present (julia> or prompt style markers)
 			-- This indicates command execution is complete
 			if last_text:match("julia>") or last_text:match("@v[%d%.]+%) pkg>") or last_text:match("shell>") then
