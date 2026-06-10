@@ -1,1 +1,1 @@
-printf("skibidi")
+println("skibidi")
