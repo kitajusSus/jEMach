@@ -164,7 +164,7 @@ local function start_native_terminal()
 		return false
 	end
 
-	local cmd_parts = { "julia" }
+	local cmd_parts = { "julia", "-t", "auto" }
 	if config.options.activate_project_on_start then
 		local project_root = utils.find_project_root()
 		if project_root then
@@ -301,7 +301,7 @@ function M.toggle_repl()
 		return
 	end
 
-	local cmd_parts = { "julia" }
+	local cmd_parts = { "julia", "-t", "auto" }
 
 	if config.options.activate_project_on_start then
 		local project_root = utils.find_project_root()
