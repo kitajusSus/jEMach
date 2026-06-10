@@ -89,7 +89,7 @@ function M.start_server_if_needed()
 
 	M.state.rpc_server = vim.loop.new_pipe(false)
 	local err = M.state.rpc_server:bind(M.state.rpc_pipe_path)
-	if err then
+	if err and err ~= 0 then
 		vim.notify("⚠️ Failed to bind workspace socket: " .. tostring(err), vim.log.levels.WARN)
 		M.state.rpc_server:close()
 		M.state.rpc_server = nil
