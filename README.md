@@ -34,7 +34,10 @@ If you are already in the terminal where you want to run the workspace:
    ```
 3. **Load the watcher** in the Julia REPL:
    ```julia
-   # If running from the repository:
+   # Load as a package (when running julia --project=.)
+   using jEMach
+
+   # Or fallback via include:
    include("scripts/jl_watcher.jl")
 
    # Or if installed via Neovim (Note: Julia's include() doesn't expand '~', so use homedir()):
@@ -49,8 +52,11 @@ If you are already in the terminal where you want to run the workspace:
    ```
 2. **Load the background watcher** in the Julia REPL:
    ```julia
+   # Load as a package (when running julia --project=.)
+   using jEMach
+
+   # Or fallback via include:
    include("scripts/jl_watcher.jl")
-   # Or using the absolute path with homedir() if needed (see above)
    ```
 3. **Split your tmux window** vertically (e.g. press your tmux prefix, usually `Ctrl+b`, then `%`) and launch the TUI in the new pane:
    ```bash
