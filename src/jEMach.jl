@@ -9,6 +9,7 @@
 module jEMach
 
     import Dates
+    import Pkg
 
     const STATE_FILE = "/tmp/jl_tui_state.json"
     const UPDATE_INTERVAL = 2.0  # seconds between state refreshes
@@ -383,6 +384,61 @@ module jEMach
         println(" File: $filepath")
         println(" " * "✓"^60)
         return nothing
+    end
+
+    function compile_sysimage(extra_pkgs::Vector{Symbol} = Symbol[])
+        println("Starting jEMach system image compilation...")
+        
+        # 1. Ensure PackageCompiler is installed in the global environment
+        current_project = Pkg.project().path
+        
+        println("Ensuring PackageCompiler.jl is available in global environment...")
+        try
+            Pkg.activate() # activate global environment
+            Pkg.add("PackageCompiler")
+        catch e
+            println("Failed to install PackageCompiler: ", e)
+            return
+        end
+        
+        # Reactivate original project
+        Pkg.activate(current_project)
+        
+        # Load PackageCompiler dynamically
+        PackageCompiler = try
+            Base.require(Base.PkgId(Base.UUID("9b87118b-dbb9-11e9-10c9-df29585e1e1b"), "PackageCompiler"))
+        catch e
+            println("Could not load PackageCompiler.jl: ", e)
+            return
+        end
+        
+        # 2. Define the output path
+        sysimage_dir = joinpath(homedir(), ".julia", "sysimages")
+        if !isdir(sysimage_dir)
+            mkpath(sysimage_dir)
+        end
+        sysimage_path = joinpath(sysimage_dir, "jemach_sysimage.so")
+        
+        pkgs_to_compile = unique(vcat([:jEMach, :Dates], extra_pkgs))
+        println("Compiling sysimage for packages: ", pkgs_to_compile)
+        println("Output path: ", sysimage_path)
+        println("This process may take 2-5 minutes. Please be patient...")
+        
+        try
+            Base.invokelatest(
+                PackageCompiler.create_sysimage,
+                pkgs_to_compile,
+                sysimage_path = sysimage_path,
+                project = current_project
+            )
+            println("\n" * "✓"^60)
+            println(" System image compiled successfully!")
+            println(" File: $sysimage_path")
+            println(" To use it, run Julia with: julia -J $sysimage_path")
+            println(" " * "✓"^60)
+        catch e
+            println("Error during sysimage compilation: ", e)
+        end
     end
 
     # ---------------------------------------------------------------------------
