@@ -185,6 +185,32 @@ module jEMach
             end
         end
         
+        # Methods & Return Types
+        if isa(val, Function) || (hasmethod(methods, Tuple{typeof(val)}) && !isempty(methods(val)))
+            try
+                ms = methods(val)
+                println(bold * "Methods & Return Types:" * reset)
+                for m in first(ms, 15)
+                    temp = m.sig
+                    while temp isa UnionAll
+                        temp = temp.body
+                    end
+                    params = temp.parameters
+                    sig_types = Tuple{params[2:end]...}
+                    rts = Base.return_types(val, sig_types)
+                    rt = isempty(rts) ? "Any" : rts[1]
+                    m_str = sprint(show, m)
+                    sig_part = split(m_str, " @ ")[1]
+                    println("  ", sig_part, " -> ", rt)
+                end
+                if length(ms) > 15
+                    println("  ... ($(length(ms) - 15) more methods)")
+                end
+                println()
+            catch
+            end
+        end
+        
         # Search REPL history for creation/assignment
         hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
         if isfile(hist_path)
