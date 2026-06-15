@@ -10,6 +10,7 @@ module jEMach
 
     import Dates
     import Pkg
+    import Sockets
 
     const STATE_FILE = "/tmp/jl_tui_state.json"
     const UPDATE_INTERVAL = 2.0  # seconds between state refreshes
@@ -513,7 +514,6 @@ module jEMach
 
             # Publish to Zig broker
             try
-                import Sockets
                 conn = Sockets.connect("/tmp/jemach.sock")
                 write(conn, json)
                 close(conn)
