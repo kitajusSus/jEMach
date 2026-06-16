@@ -2,6 +2,20 @@ local M = {}
 local config = require("jemach.config")
 local repl = nil -- Lazy load to avoid circular dependencies
 
+local function get_project_dir()
+	local cwd = vim.fn.getcwd()
+	local proj_toml = vim.fs.find("Project.toml", { upward = true, path = cwd })[1]
+	if proj_toml then
+		return vim.fs.dirname(proj_toml)
+	end
+	return cwd
+end
+
+local function get_safe_name()
+	local pdir = get_project_dir()
+	return pdir:gsub("[^a-zA-Z0-9]", "_")
+end
+
 M.state = {
 	workspace_bufnr = nil,
 	workspace_win_id = nil,
@@ -91,6 +105,8 @@ local function handle_rpc_data(data)
 end
 
 function M.start_server_if_needed()
+	M.state.rpc_pipe_path = "/tmp/jemach_" .. get_safe_name() .. ".sock"
+
 	if M.state.rpc_client and not M.state.rpc_client:is_closing() then
 		return
 	end
@@ -112,7 +128,7 @@ function M.start_server_if_needed()
 			-- Start the broker in the background using jobstart
 			local broker_bin = require("jemach.utils").get_plugin_root() .. "/zig/zig-out/bin/jemach-broker"
 			if vim.fn.executable(broker_bin) == 1 then
-				vim.fn.jobstart({ broker_bin }, { detach = true })
+				vim.fn.jobstart({ broker_bin, M.state.rpc_pipe_path }, { detach = true })
 				-- Wait a little bit and retry once.
 				vim.defer_fn(function()
 					M.start_server_if_needed()

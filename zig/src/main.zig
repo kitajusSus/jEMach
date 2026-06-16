@@ -40,12 +40,14 @@ extern fn recv(sockfd: c_int, buf: [*]u8, len: usize, flags: c_int) isize;
 extern fn usleep(usec: c_uint) c_int;
 
 pub fn main(init: std.process.Init) !void {
-    _ = init;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const socket_path = "/tmp/jemach.sock";
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer it.deinit();
+    _ = it.skip();
+    const socket_path = it.next() orelse "/tmp/jemach.sock";
     _ = unlink(socket_path);
 
     const server_fd = socket(AF_UNIX, SOCK_STREAM, 0);

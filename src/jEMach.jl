@@ -12,8 +12,22 @@ import Dates
 import Pkg
 import Sockets
 
-const STATE_FILE = "/tmp/jl_tui_state.json"
+const STATE_FILE = Ref{String}("/tmp/jl_tui_state.json")
+const SOCKET_PATH = Ref{String}("/tmp/jemach.sock")
 const UPDATE_INTERVAL = 2.0  # seconds between state refreshes
+
+function _get_project_dir()::String
+    proj_path = try Pkg.project().path catch; nothing end
+    if !isnothing(proj_path) && isfile(proj_path) && !occursin(".julia/environments", proj_path)
+        return dirname(proj_path)
+    else
+        return pwd()
+    end
+end
+
+function _get_safe_name(proj_dir::String)::String
+    return replace(proj_dir, r"[^a-zA-Z0-9]" => "_")
+end
 
 # ---------------------------------------------------------------------------
 # Minimal JSON serialiser (no external dependencies)
@@ -507,15 +521,15 @@ function publish_state()
         json = _serialize(state, pkgs)
 
         # Write to file (fallback / legacy)
-        temp_file = STATE_FILE * ".tmp"
+        temp_file = STATE_FILE[] * ".tmp"
         open(temp_file, "w") do f
             write(f, json)
         end
-        mv(temp_file, STATE_FILE; force = true)
+        mv(temp_file, STATE_FILE[]; force = true)
 
         # Publish to Zig broker
         try
-            conn = Sockets.connect("/tmp/jemach.sock")
+            conn = Sockets.connect(SOCKET_PATH[])
             write(conn, json)
             close(conn)
         catch
@@ -531,7 +545,7 @@ function start(; split::Bool = true)
     else
         _running[] = true
         _task_ref[] = @async begin
-            @info "jEMach Watcher started — writing state to $STATE_FILE"
+            @info "jEMach Watcher started — writing state to $(STATE_FILE[])"
             while _running[]
                 publish_state()
                 sleep(UPDATE_INTERVAL)
@@ -565,7 +579,7 @@ end
 
 function status()
     return if _running[]
-        println("jEMach Watcher is RUNNING  →  $STATE_FILE")
+        println("jEMach Watcher is RUNNING  →  $(STATE_FILE[])")
     else
         println("jEMach Watcher is STOPPED")
     end
@@ -578,6 +592,11 @@ function __init__()
     else
         HIST_START_POS[] = 0
     end
+    # Initialize unique session paths based on the project folder
+    safe_name = _get_safe_name(_get_project_dir())
+    STATE_FILE[] = "/tmp/jl_tui_state_" * safe_name * ".json"
+    SOCKET_PATH[] = "/tmp/jemach_" * safe_name * ".sock"
+
     # Auto-start watcher silently (without split) when loaded as a package
     return start(split = false)
 end

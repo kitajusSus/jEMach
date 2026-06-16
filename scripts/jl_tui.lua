@@ -70,6 +70,34 @@ local function fd_set_isset(s, fd)
 	return (s.fds_bits[word] % (2 * mask)) >= mask
 end
 
+local function get_project_dir()
+	local handle = io.popen("pwd")
+	local cwd = handle:read("*a"):gsub("%s+", "")
+	handle:close()
+	local dir = cwd
+	while dir and dir ~= "" and dir ~= "/" do
+		local f = io.open(dir .. "/Project.toml", "r")
+		if f then
+			f:close()
+			return dir
+		end
+		local parent = dir:match("(.*)/[^/]+$")
+		if not parent or parent == dir then
+			break
+		end
+		dir = parent
+	end
+	return cwd
+end
+
+local function get_safe_name()
+	local pdir = get_project_dir()
+	return pdir:gsub("[^a-zA-Z0-9]", "_")
+end
+
+local safe_name = get_safe_name()
+local socket_path = "/tmp/jemach_" .. safe_name .. ".sock"
+
 local socket_fd = -1
 local last_connect_try = 0
 local socket_buffer = ""
@@ -92,7 +120,7 @@ local function try_connect_socket()
 
 	local addr = ffi.new("struct sockaddr_un")
 	addr.sun_family = 1
-	ffi.copy(addr.sun_path, "/tmp/jemach.sock", 16)
+	ffi.copy(addr.sun_path, socket_path)
 
 	local res = ffi.C.connect(fd, addr, 110)
 	if res == 0 then
@@ -357,7 +385,7 @@ end
 -- ---------------------------------------------------------------------------
 -- State management
 -- ---------------------------------------------------------------------------
-local STATE_FILE = "/tmp/jl_tui_state.json"
+local STATE_FILE = "/tmp/jl_tui_state_" .. safe_name .. ".json"
 local REFRESH_MS = 1500 -- state file poll interval (ms)
 
 local repl_pane = arg and arg[1] or "{left-of}"
