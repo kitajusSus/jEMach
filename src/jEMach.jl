@@ -84,9 +84,33 @@ function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
     T = typeof(val)
 
     try
-        if val isa Dict
+        type_name_str = string(T)
+        # 1. DataFrames / Tables.jl interface
+        if occursin("DataFrame", type_name_str) || (hasmethod(names, Tuple{T}) && hasmethod(getindex, Tuple{T, Symbol}))
+            try
+                col_names = names(val)
+                r_count = size(val, 1)
+                for cname in col_names[1:min(length(col_names), 20)]
+                    c_str = string(cname)
+                    c_col = val[!, Symbol(cname)]
+                    c_expr = parent_expr * "[!, :" * c_str * "]"
+                    push!(children, Dict{String, Any}(
+                        "name" => ":" * c_str,
+                        "kind" => "variable",
+                        "type" => string(typeof(c_col)) * " (" * string(r_count) * " rows)",
+                        "value" => _value_preview(c_col),
+                        "expr" => c_expr
+                    ))
+                end
+            catch
+            end
+            return children
+        end
+
+        # 2. Dictionaries
+        if val isa AbstractDict
             for (k, v) in val
-                length(children) >= 15 && break
+                length(children) >= 20 && break
                 k_str = string(k)
                 k_expr = parent_expr * "[" * repr(k) * "]"
                 push!(children, Dict{String, Any}(
@@ -97,8 +121,9 @@ function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
                     "expr" => k_expr
                 ))
             end
+        # 3. 1D Arrays
         elseif val isa AbstractArray && ndims(val) == 1
-            for i in 1:min(length(val), 15)
+            for i in 1:min(length(val), 20)
                 push!(children, Dict{String, Any}(
                     "name" => "[$i]",
                     "kind" => "variable",
@@ -107,6 +132,30 @@ function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
                     "expr" => parent_expr * "[$i]"
                 ))
             end
+        # 4. 2D Matrices / Arrays
+        elseif val isa AbstractArray && ndims(val) == 2
+            rows, cols = size(val)
+            for i in 1:min(rows, 5)
+                for j in 1:min(cols, 5)
+                    push!(children, Dict{String, Any}(
+                        "name" => "[$i, $j]",
+                        "kind" => "variable",
+                        "type" => string(eltype(val)),
+                        "value" => _value_preview(val[i, j]),
+                        "expr" => parent_expr * "[$i, $j]"
+                    ))
+                end
+            end
+        # 5. Multidimensional Arrays (ndims > 2)
+        elseif val isa AbstractArray && ndims(val) > 2
+            push!(children, Dict{String, Any}(
+                "name" => "[dimensions]",
+                "kind" => "variable",
+                "type" => "Tuple",
+                "value" => string(size(val)),
+                "expr" => "size(" * parent_expr * ")"
+            ))
+        # 6. Tuples and NamedTuples
         elseif val isa NamedTuple
             for name in keys(val)
                 v = val[name]
@@ -119,11 +168,23 @@ function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
                     "expr" => parent_expr * "." * name_str
                 ))
             end
+        elseif val isa Tuple
+            for (i, v) in enumerate(val)
+                i > 20 && break
+                push!(children, Dict{String, Any}(
+                    "name" => "[$i]",
+                    "kind" => "variable",
+                    "type" => string(typeof(v)),
+                    "value" => _value_preview(v),
+                    "expr" => parent_expr * "[$i]"
+                ))
+            end
+        # 7. Arbitrary composite structs
         elseif !isprimitivetype(T) && T !== Module && T !== Function && T !== DataType && T !== UnionAll
             fns = fieldnames(T)
             for f in fns
                 f_str = string(f)
-                f_val = getfield(val, f)
+                f_val = try getfield(val, f) catch; continue end
                 push!(children, Dict{String, Any}(
                     "name" => f_str,
                     "kind" => "variable",
@@ -598,12 +659,67 @@ end
 
 const _task_ref = Ref{Union{Task, Nothing}}(nothing)
 const _running = Ref{Bool}(false)
+const _socket_clients = Set{Sockets.PipeEndpoint}()
+const _server_ref = Ref{Union{Sockets.PipeServer, Nothing}}(nothing)
+const _last_serialized_json = Ref{String}("")
+
+function _start_socket_server()
+    path = SOCKET_PATH[]
+    if isfile(path) || isfifo(path)
+        try rm(path; force = true) catch; end
+    end
+    try
+        server = Sockets.listen(path)
+        _server_ref[] = server
+        @async begin
+            while _running[] && isopen(server)
+                try
+                    client = Sockets.accept(server)
+                    @async begin
+                        try
+                            if isopen(client)
+                                line = readline(client)
+                                if startswith(line, "SUB")
+                                    push!(_socket_clients, client)
+                                    if !isempty(_last_serialized_json[])
+                                        write(client, _last_serialized_json[] * "\n")
+                                        flush(client)
+                                    end
+                                end
+                            end
+                        catch
+                        end
+                    end
+                catch
+                    break
+                end
+            end
+        end
+    catch e
+        @warn "jEMach Socket Server failed to listen on $path" exception = e
+    end
+end
+
+function _stop_socket_server()
+    if !isnothing(_server_ref[])
+        try close(_server_ref[]) catch; end
+        _server_ref[] = nothing
+    end
+    for client in _socket_clients
+        try close(client) catch; end
+    end
+    empty!(_socket_clients)
+    if isfile(SOCKET_PATH[])
+        try rm(SOCKET_PATH[]; force = true) catch; end
+    end
+end
 
 function publish_state()
     return try
         state = _collect_state()
         pkgs = _get_packages()
         json = _serialize(state, pkgs)
+        _last_serialized_json[] = json
 
         # Write to file (fallback / legacy)
         temp_file = STATE_FILE[] * ".tmp"
@@ -612,12 +728,23 @@ function publish_state()
         end
         mv(temp_file, STATE_FILE[]; force = true)
 
-        # Publish to Zig broker
-        try
-            conn = Sockets.connect(SOCKET_PATH[])
-            write(conn, json)
-            close(conn)
-        catch
+        # Broadcast to all UNIX domain socket subscribers
+        msg = json * "\n"
+        dead_clients = Sockets.PipeEndpoint[]
+        for client in _socket_clients
+            try
+                if isopen(client)
+                    write(client, msg)
+                    flush(client)
+                else
+                    push!(dead_clients, client)
+                end
+            catch
+                push!(dead_clients, client)
+            end
+        end
+        for dc in dead_clients
+            delete!(_socket_clients, dc)
         end
     catch e
         @warn "jEMach Watcher error" exception = e
@@ -629,12 +756,14 @@ function start(; split::Bool = true)
         @info "jEMach Watcher already running"
     else
         _running[] = true
+        _start_socket_server()
         _task_ref[] = @async begin
-            @info "jEMach Watcher started — writing state to $(STATE_FILE[])"
+            @info "jEMach Watcher started — writing state to $(STATE_FILE[]) and socket $(SOCKET_PATH[])"
             while _running[]
                 publish_state()
                 sleep(UPDATE_INTERVAL)
             end
+            _stop_socket_server()
             @info "jEMach Watcher stopped"
         end
     end
@@ -659,6 +788,7 @@ end
 
 function stop()
     _running[] = false
+    _stop_socket_server()
     return @info "jEMach Watcher stopping after current cycle…"
 end
 

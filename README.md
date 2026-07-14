@@ -63,6 +63,8 @@ If you are already in the terminal where you want to run the workspace:
    include(joinpath(homedir(), ".local/share/nvim/site/pack/core/opt/jemach/scripts/jl_watcher.jl"))
    ```
 
+   > **Tip (Auto-Hooking)**: To load `jEMach` automatically whenever an interactive Julia REPL starts, add a snippet to `~/.julia/config/startup.jl`. See details in [docs/src/startup.md](docs/src/startup.md).
+
 ### Quick Start (Manual Setup)
 
 1. **Start Julia** in your tmux pane:
