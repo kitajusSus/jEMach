@@ -70,7 +70,13 @@ local function fd_set_isset(s, fd)
 	return (s.fds_bits[word] % (2 * mask)) >= mask
 end
 
+local json_parse -- forward declaration
+
 local function get_project_dir()
+	local env_proj = os.getenv("JEMACH_PROJ")
+	if env_proj and env_proj ~= "" then
+		return env_proj
+	end
 	local handle = io.popen("pwd")
 	local cwd = handle:read("*a"):gsub("%s+", "")
 	handle:close()
@@ -90,13 +96,56 @@ local function get_project_dir()
 	return cwd
 end
 
-local function get_safe_name()
-	local pdir = get_project_dir()
+local function get_safe_name(dir)
+	local pdir = dir or get_project_dir()
 	return pdir:gsub("[^a-zA-Z0-9]", "_")
 end
 
-local safe_name = get_safe_name()
-local socket_path = "/tmp/jemach_" .. safe_name .. ".sock"
+local function find_active_jemach()
+	-- Look for the most recently modified jl_tui_state_*.json in /tmp
+	local h = io.popen("ls -t /tmp/jl_tui_state_*.json 2>/dev/null | head -n 1")
+	if h then
+		local latest_file = h:read("*l")
+		h:close()
+		if latest_file and latest_file ~= "" then
+			local sname = latest_file:match("/tmp/jl_tui_state_(.*)%.json$")
+			local sock = sname and ("/tmp/jemach_" .. sname .. ".sock") or nil
+			return sock, latest_file
+		end
+	end
+	return nil, nil
+end
+
+local repl_pane = (arg and arg[1] and arg[1] ~= "") and arg[1] or "{left-of}"
+
+local default_safe_name = get_safe_name()
+local socket_path = (arg and arg[2] and arg[2] ~= "") and arg[2]
+	or os.getenv("JEMACH_SOCKET")
+	or ("/tmp/jemach_" .. default_safe_name .. ".sock")
+
+local STATE_FILE = (arg and arg[3] and arg[3] ~= "") and arg[3]
+	or os.getenv("JEMACH_STATE")
+	or ("/tmp/jl_tui_state_" .. default_safe_name .. ".json")
+
+local function check_and_discover()
+	local f = io.open(STATE_FILE, "r")
+	if f then
+		f:close()
+		return
+	end
+	local auto_sock, auto_state = find_active_jemach()
+	if auto_state then
+		local af = io.open(auto_state, "r")
+		if af then
+			af:close()
+			STATE_FILE = auto_state
+			if auto_sock then
+				socket_path = auto_sock
+			end
+		end
+	end
+end
+check_and_discover()
 
 local socket_fd = -1
 local last_connect_try = 0
@@ -109,10 +158,18 @@ local function try_connect_socket()
 	end
 
 	local now = os.time()
-	if now - last_connect_try < 3 then
+	if now - last_connect_try < 2 then
 		return
 	end
 	last_connect_try = now
+
+	-- If socket file doesn't exist at socket_path, retry discovery
+	local sf = io.open(socket_path, "r")
+	if not sf then
+		check_and_discover()
+	else
+		sf:close()
+	end
 
 	local fd = ffi.C.socket(1, 1, 0) -- AF_UNIX = 1, SOCK_STREAM = 1
 	if fd < 0 then
@@ -133,8 +190,8 @@ local function try_connect_socket()
 end
 
 local function handle_socket_read()
-	local buf = ffi.new("char[4096]")
-	local n = tonumber(ffi.C.read(socket_fd, buf, 4096))
+	local buf = ffi.new("char[65536]")
+	local n = tonumber(ffi.C.read(socket_fd, buf, 65536))
 	if not n or n <= 0 then
 		ffi.C.close(socket_fd)
 		socket_fd = -1
@@ -399,10 +456,7 @@ end
 -- ---------------------------------------------------------------------------
 -- State management
 -- ---------------------------------------------------------------------------
-local STATE_FILE = "/tmp/jl_tui_state_" .. safe_name .. ".json"
 local REFRESH_MS = 1500 -- state file poll interval (ms)
-
-local repl_pane = arg and arg[1] or "{left-of}"
 
 -- hidden[key] = true  means the item is hidden from view
 -- key = "ModuleName" for a module header, "ModuleName/ItemName" for items
@@ -481,6 +535,10 @@ local function load_state()
 	end
 
 	local mt = file_mtime(STATE_FILE)
+	if mt == 0 then
+		check_and_discover()
+		mt = file_mtime(STATE_FILE)
+	end
 	if mt == 0 or mt == last_mtime then
 		return false
 	end

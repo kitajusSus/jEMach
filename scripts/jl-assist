@@ -7,6 +7,8 @@
 # Options:
 #   -p PANE_ID   Target Julia REPL pane (default: auto-detect or left-of)
 #   -w WIDTH     Width of the TUI pane in columns (default: 60)
+#   -s SOCKET    Unix domain socket path (optional)
+#   -d STATE     State JSON file path (optional)
 #   -f           Force a new pane even if one already exists
 #   -h           Show this help
 #
@@ -30,7 +32,9 @@ TUI_SCRIPT="${SCRIPT_DIR}/jl_tui.lua"
 # Defaults
 # --------------------------------------------------------------------------
 JULIA_PANE=""
-PANE_WIDTH=60
+PANE_WIDTH=65
+SOCKET=""
+STATE=""
 FORCE_NEW=0
 
 # --------------------------------------------------------------------------
@@ -44,10 +48,12 @@ usage() {
 # --------------------------------------------------------------------------
 # Parse arguments
 # --------------------------------------------------------------------------
-while getopts "p:w:fh" opt; do
+while getopts "p:w:s:d:fh" opt; do
   case "$opt" in
     p) JULIA_PANE="$OPTARG" ;;
     w) PANE_WIDTH="$OPTARG" ;;
+    s) SOCKET="$OPTARG" ;;
+    d) STATE="$OPTARG" ;;
     f) FORCE_NEW=1 ;;
     h) usage ;;
     *) echo "Unknown option: $opt"; usage ;;
@@ -115,7 +121,9 @@ fi
 # --------------------------------------------------------------------------
 echo "Launching Julia Workspace TUI (pane width: ${PANE_WIDTH})…"
 
-tmux split-window -h -l "${PANE_WIDTH}" \
-  "luajit '${TUI_SCRIPT}' '${JULIA_PANE}' || { echo 'TUI exited with error — press any key'; read -n1; }"
+PANE_DIR="$(tmux display-message -t "${JULIA_PANE}" -p "#{pane_current_path}" 2>/dev/null || pwd)"
+
+tmux split-window -h -l "${PANE_WIDTH}" -c "${PANE_DIR}" \
+  "luajit '${TUI_SCRIPT}' '${JULIA_PANE}' '${SOCKET}' '${STATE}' || { echo 'TUI exited with error — press any key'; read -n1; }"
 
 echo "Done. TUI pane started alongside Julia REPL pane ${JULIA_PANE}."

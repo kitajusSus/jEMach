@@ -16,7 +16,7 @@ export make_procedure, record, record_stop, run_procedure, list_procedures, get_
 
 const STATE_FILE = Ref{String}("/tmp/jl_tui_state.json")
 const SOCKET_PATH = Ref{String}("/tmp/jemach.sock")
-const UPDATE_INTERVAL = 2.0  # seconds between state refreshes
+const UPDATE_INTERVAL = 0.5  # seconds between state refreshes
 
 function _get_project_dir()::String
     proj_path = try Pkg.project().path catch; nothing end
@@ -1484,14 +1484,17 @@ function _close_tui_pane()
     # 2. Fallback: Search current tmux window for any pane running jl-assist or jl_tui.lua
     if haskey(ENV, "TMUX")
         try
-            out = read(`tmux list-panes -F "#{pane_id} #{pane_current_command}"`, String)
+            out = read(`tmux list-panes -F "#{pane_id} #{pane_current_command} #{pane_title}"`, String)
+            cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
             for line in split(strip(out), '\n')
                 parts = split(strip(line))
-                if length(parts) >= 2
+                if !isempty(parts)
                     pid = parts[1]
-                    cmd = parts[2]
-                    if cmd == "luajit" || occursin("jl_tui", cmd) || occursin("jl-assist", cmd)
-                        run(`tmux kill-pane -t $pid`)
+                    if pid != cur_pane # Never kill Julia's own pane!
+                        line_str = lowercase(line)
+                        if occursin("luajit", line_str) || occursin("jl_tui", line_str) || occursin("jl-assist", line_str)
+                            try run(`tmux kill-pane -t $pid`) catch; end
+                        end
                     end
                 end
             end
@@ -1561,15 +1564,42 @@ function start(; split::Bool = true)
     end
 
     if split
-        # Find the path of the jl-assist TUI script
-        assist_path = normpath(joinpath(@__DIR__, "..", "scripts", "jl-assist"))
+        tui_script = normpath(joinpath(@__DIR__, "..", "scripts", "jl_tui.lua"))
+        proj_dir = _get_project_dir()
+        sock = SOCKET_PATH[]
+        st_file = STATE_FILE[]
 
-        try
-            pane_id = strip(read(`tmux split-window -P -F "#{pane_id}" -h -l 80 $assist_path`, String))
-            _tui_pane_ref[] = pane_id
-            println("🚀 tmux TUI split opened ($pane_id)!")
-        catch e
-            @warn "Failed to open tmux TUI pane (are you inside tmux?)" exception = e
+        # Publish initial state immediately so the state file is present before TUI starts
+        publish_state()
+
+        if haskey(ENV, "TMUX")
+            try
+                already_open = false
+                if !isempty(_tui_pane_ref[])
+                    try
+                        run(pipeline(`tmux display-message -t $(_tui_pane_ref[]) -p "#{pane_id}"`, devnull))
+                        already_open = true
+                    catch
+                        _tui_pane_ref[] = ""
+                    end
+                end
+
+                if already_open
+                    println("🚀 tmux TUI split already active ($(_tui_pane_ref[]))")
+                else
+                    _close_tui_pane() # Clean up any orphaned panels
+                    cur_pane = try strip(read(`tmux display-message -p "#{pane_id}"`, String)) catch; "" end
+                    pane_arg = !isempty(cur_pane) ? cur_pane : "{left-of}"
+                    cmd = `tmux split-window -P -F "#{pane_id}" -h -l 65 -c $(proj_dir) -e JEMACH_SOCKET=$(sock) -e JEMACH_STATE=$(st_file) -e JEMACH_PROJ=$(proj_dir) luajit $(tui_script) $(pane_arg) $(sock) $(st_file)`
+                    pane_id = strip(read(cmd, String))
+                    _tui_pane_ref[] = pane_id
+                    println("🚀 tmux TUI split opened ($pane_id)!")
+                end
+            catch e
+                @warn "Failed to open tmux TUI pane (are you inside tmux?)" exception = e
+            end
+        else
+            @info "Not inside tmux session. To launch the TUI in another terminal:\n  luajit $(tui_script) {left-of} $(sock) $(st_file)"
         end
     end
     return nothing
