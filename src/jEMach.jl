@@ -495,9 +495,11 @@ function _is_global_or_type(sym::Symbol)::Bool
     return false
 end
 
-function _collect_ast_symbols!(ex, assigned::Set{Symbol}, referenced::Set{Symbol})
+function _collect_ast_symbols!(ex, assigned::Set{Symbol}, referenced::Set{Symbol}, local_scope::Set{Symbol} = Set{Symbol}())
     if ex isa Symbol
-        push!(referenced, ex)
+        if !(ex in local_scope) && !(ex in assigned)
+            push!(referenced, ex)
+        end
     elseif ex isa Expr
         if ex.head == :(=)
             lhs = ex.args[1]
@@ -509,21 +511,63 @@ function _collect_ast_symbols!(ex, assigned::Set{Symbol}, referenced::Set{Symbol
                 end
             end
             if length(ex.args) >= 2
-                _collect_ast_symbols!(ex.args[2], assigned, referenced)
+                _collect_ast_symbols!(ex.args[2], assigned, referenced, local_scope)
+            end
+        elseif ex.head == :(->)
+            new_scope = copy(local_scope)
+            params = ex.args[1]
+            if params isa Symbol
+                push!(new_scope, params)
+            elseif params isa Expr && params.head == :tuple
+                for a in params.args
+                    if a isa Symbol
+                        push!(new_scope, a)
+                    elseif a isa Expr && a.head == :(::) && a.args[1] isa Symbol
+                        push!(new_scope, a.args[1])
+                    end
+                end
+            end
+            if length(ex.args) >= 2
+                _collect_ast_symbols!(ex.args[2], assigned, referenced, new_scope)
+            end
+        elseif ex.head in (:generator, :comprehension)
+            new_scope = copy(local_scope)
+            for i in 2:length(ex.args)
+                iter_spec = ex.args[i]
+                if iter_spec isa Expr && iter_spec.head == :(=)
+                    var = iter_spec.args[1]
+                    if var isa Symbol
+                        push!(new_scope, var)
+                    end
+                    _collect_ast_symbols!(iter_spec.args[2], assigned, referenced, local_scope)
+                end
+            end
+            _collect_ast_symbols!(ex.args[1], assigned, referenced, new_scope)
+        elseif ex.head in (:for, :while)
+            new_scope = copy(local_scope)
+            if ex.head == :for && length(ex.args) >= 1 && ex.args[1] isa Expr && ex.args[1].head == :(=)
+                loop_var = ex.args[1].args[1]
+                if loop_var isa Symbol
+                    push!(new_scope, loop_var)
+                end
+                _collect_ast_symbols!(ex.args[1].args[2], assigned, referenced, local_scope)
+            end
+            for i in 2:length(ex.args)
+                _collect_ast_symbols!(ex.args[i], assigned, referenced, new_scope)
             end
         elseif ex.head == :call
             for a in ex.args
-                _collect_ast_symbols!(a, assigned, referenced)
+                _collect_ast_symbols!(a, assigned, referenced, local_scope)
             end
         elseif ex.head == :macrocall
             for i in 2:length(ex.args)
-                _collect_ast_symbols!(ex.args[i], assigned, referenced)
+                _collect_ast_symbols!(ex.args[i], assigned, referenced, local_scope)
             end
         elseif ex.head == :.
-            _collect_ast_symbols!(ex.args[1], assigned, referenced)
+            _collect_ast_symbols!(ex.args[1], assigned, referenced, local_scope)
         else
             for a in ex.args
-                _collect_ast_symbols!(a, assigned, referenced)
+                _collect_ast_symbols!(a, assigned, referenced, local_scope)
             end
         end
     end
@@ -572,17 +616,59 @@ function make_procedure(
         cmds = all_cmds[max(1, end - 4):end]
     end
 
-    cmds = filter(c -> !isempty(strip(c)) && !occursin("make_procedure", c), cmds)
-    if isempty(cmds)
-        @warn "No commands found to create procedure '$proc_name'"
+    # Clean out comments and make_procedure calls
+    clean_cmds = String[]
+    for c in cmds
+        s = strip(c)
+        if !isempty(s) && !startswith(s, "#") && !occursin("make_procedure", s)
+            push!(clean_cmds, c)
+        end
+    end
+
+    if isempty(clean_cmds)
+        @warn "No executable commands found to create procedure '$proc_name'"
         return nothing
     end
 
-    assigned = Set{Symbol}()
+    # Step 1: Detect initial constant/literal assignments to promote as procedure parameters
+    promoted_params = String[]
+    promoted_syms = Set{Symbol}()
+    computation_start_idx = 1
+
+    for (i, cmd) in enumerate(clean_cmds)
+        ex = try Meta.parse("begin\n" * cmd * "\nend") catch; nothing end
+        isnothing(ex) && break
+        sub = filter(a -> !(a isa LineNumberNode), ex.args)
+        isempty(sub) && continue
+        stmt = sub[1]
+        if stmt isa Expr && stmt.head == :(=) && stmt.args[1] isa Symbol
+            lhs = stmt.args[1]
+            rhs = stmt.args[2]
+            rhs_refs = Set{Symbol}()
+            _collect_ast_symbols!(rhs, Set{Symbol}(), rhs_refs)
+            if isempty(intersect(rhs_refs, promoted_syms)) && !any(occursin(string(a), string(rhs)) for a in promoted_syms)
+                push!(promoted_syms, lhs)
+                push!(promoted_params, strip(cmd))
+                computation_start_idx = i + 1
+                continue
+            end
+        end
+        break
+    end
+
+    if computation_start_idx > length(clean_cmds)
+        computation_start_idx = length(clean_cmds)
+        pop!(promoted_params)
+    end
+
+    body_cmds = clean_cmds[computation_start_idx:end]
+
+    # Step 2: Analyze body_cmds for remaining free variables
+    assigned = copy(promoted_syms)
     referenced = Set{Symbol}()
     parsed_exprs = Expr[]
 
-    for cmd in cmds
+    for cmd in body_cmds
         ex = try Meta.parse("begin\n" * cmd * "\nend") catch; nothing end
         if !isnothing(ex)
             push!(parsed_exprs, ex)
@@ -596,20 +682,22 @@ function make_procedure(
     final_params = !isempty(params) ? params : sort(detected_params, by = string)
 
     required_params = String[]
-    default_params = String[]
+    other_default_params = String[]
     for p in final_params
         (p_str, has_default) = _default_param_str(p)
         if has_default
-            push!(default_params, p_str)
+            push!(other_default_params, p_str)
         else
             push!(required_params, p_str)
         end
     end
-    sig_args = join(vcat(required_params, default_params), ", ")
+
+    all_sig_params = vcat(required_params, promoted_params, other_default_params)
+    sig_args = join(all_sig_params, ", ")
     func_sig = "$(proc_name)($sig_args)"
 
     body_lines = String[]
-    for (i, cmd) in enumerate(cmds)
+    for cmd in body_cmds
         for line in split(cmd, '\n')
             push!(body_lines, "    " * line)
         end
