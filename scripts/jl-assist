@@ -116,6 +116,6 @@ fi
 echo "Launching Julia Workspace TUI (pane width: ${PANE_WIDTH})…"
 
 tmux split-window -h -l "${PANE_WIDTH}" \
-  "luajit '${TUI_SCRIPT}' '${JULIA_PANE}'; echo 'TUI exited — press any key'; read -n1"
+  "luajit '${TUI_SCRIPT}' '${JULIA_PANE}' || { echo 'TUI exited with error — press any key'; read -n1; }"
 
 echo "Done. TUI pane started alongside Julia REPL pane ${JULIA_PANE}."

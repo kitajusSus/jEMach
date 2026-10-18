@@ -29,14 +29,20 @@ M.state = {
 	rpc_pipe_path = "/tmp/jemach.sock",
 }
 
--- Obsługa otrzymanej asynchronicznie wiadomości od Julii (JSON)
 local function handle_rpc_data(data)
+	-- Simple validation or splitting if multiple JSONs arrived
+	local ok, decoded = pcall(vim.fn.json_decode, data)
+	if ok and type(decoded) == "table" and (decoded.action == "close" or decoded.event == "stop") then
+		vim.schedule(function()
+			M.close_workspace_panel()
+		end)
+		return
+	end
+
 	if not M.state.workspace_bufnr or not vim.api.nvim_buf_is_valid(M.state.workspace_bufnr) then
 		return
 	end
 
-	-- Simple validation or splitting if multiple JSONs arrived
-	local ok, decoded = pcall(vim.fn.json_decode, data)
 	if not ok or not decoded then
 		-- Fallback to raw text if not JSON (or parsing error)
 		decoded = vim.split(data, "\n", { trimempty = true })
@@ -49,42 +55,60 @@ local function handle_rpc_data(data)
 			"",
 		}
 
-		local items = {}
-		if decoded.modules then
-			for _, mod in ipairs(decoded.modules) do
-				if mod.items then
-					for _, item in ipairs(mod.items) do
-						table.insert(items, item)
+		local flat_items = {}
+		if decoded.columns then
+			-- Data-Oriented Design (DoD) fast-path: single O(N) linear sweep
+			local cols = decoded.columns
+			local count = #(cols.names or {})
+			for i = 1, count do
+				table.insert(flat_items, {
+					name = cols.names[i],
+					type = cols.types and cols.types[i] or "",
+					value = cols.values and cols.values[i] or "",
+					expr = cols.exprs and cols.exprs[i] or cols.names[i],
+					depth = cols.depths and cols.depths[i] or 0,
+					kind = cols.kinds and cols.kinds[i] or "variable",
+					has_children = cols.has_children and cols.has_children[i] or false,
+				})
+			end
+		else
+			-- Legacy tree fallback
+			local items = {}
+			if decoded.modules then
+				for _, mod in ipairs(decoded.modules) do
+					if mod.items then
+						for _, item in ipairs(mod.items) do
+							table.insert(items, item)
+						end
+					end
+				end
+			elseif type(decoded) == "table" then
+				items = decoded
+			end
+
+			local function add_formatted_items(item, depth)
+				table.insert(flat_items, {
+					name = item.name,
+					type = item.type,
+					value = item.value,
+					expr = item.expr or item.name,
+					depth = depth,
+				})
+				if item.children then
+					table.sort(item.children, function(a, b) return a.name < b.name end)
+					for _, child in ipairs(item.children) do
+						add_formatted_items(child, depth + 1)
 					end
 				end
 			end
-		elseif type(decoded) == "table" then
-			items = decoded
-		end
 
-		local flat_items = {}
-		local function add_formatted_items(item, depth)
-			table.insert(flat_items, {
-				name = item.name,
-				type = item.type,
-				value = item.value,
-				expr = item.expr or item.name,
-				depth = depth,
-			})
-			if item.children then
-				table.sort(item.children, function(a, b) return a.name < b.name end)
-				for _, child in ipairs(item.children) do
-					add_formatted_items(child, depth + 1)
-				end
+			table.sort(items, function(a, b)
+				return a.name < b.name
+			end)
+
+			for _, item in ipairs(items) do
+				add_formatted_items(item, 0)
 			end
-		end
-
-		table.sort(items, function(a, b)
-			return a.name < b.name
-		end)
-
-		for _, item in ipairs(items) do
-			add_formatted_items(item, 0)
 		end
 
 		M.state.cache.raw_data = flat_items
@@ -205,11 +229,22 @@ function M.start_server_if_needed()
 	end)
 end
 
+function M.close_workspace_panel()
+	if M.state.workspace_win_id and vim.api.nvim_win_is_valid(M.state.workspace_win_id) then
+		vim.api.nvim_win_close(M.state.workspace_win_id, true)
+		M.state.workspace_win_id = nil
+		M.state.workspace_bufnr = nil
+		return true
+	end
+	return false
+end
+
 function M.stop_server()
 	if M.state.rpc_client and not M.state.rpc_client:is_closing() then
 		M.state.rpc_client:close()
 		M.state.rpc_client = nil
 	end
+	M.close_workspace_panel()
 end
 
 function M.update_workspace_panel()
@@ -312,11 +347,7 @@ local function setup_workspace_keymaps(bufnr)
 	end, { buffer = bufnr, desc = "Refresh" })
 
 	vim.keymap.set("n", "q", function()
-		if M.state.workspace_win_id and vim.api.nvim_win_is_valid(M.state.workspace_win_id) then
-			vim.api.nvim_win_close(M.state.workspace_win_id, true)
-			M.state.workspace_win_id = nil
-			M.state.workspace_bufnr = nil
-		end
+		M.close_workspace_panel()
 	end, { buffer = bufnr, desc = "Close" })
 end
 
@@ -334,10 +365,7 @@ function M.toggle_workspace_panel()
 		repl = require("jemach.repl")
 	end
 
-	if M.state.workspace_win_id and vim.api.nvim_win_is_valid(M.state.workspace_win_id) then
-		vim.api.nvim_win_close(M.state.workspace_win_id, true)
-		M.state.workspace_win_id = nil
-		M.state.workspace_bufnr = nil
+	if M.close_workspace_panel() then
 		return
 	end
 

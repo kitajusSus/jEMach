@@ -107,6 +107,7 @@ end
 M.toggle_repl = repl.toggle_repl
 M.send_to_repl = repl.send_to_repl
 M.toggle_workspace_panel = workspace.toggle_workspace_panel
+M.close_workspace_panel = workspace.close_workspace_panel
 M.show_history = repl.show_history
 M.toggle_workflow_mode = layout.toggle_workflow_mode
 M.focus_repl = layout.focus_repl

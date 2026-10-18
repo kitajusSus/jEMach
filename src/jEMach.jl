@@ -33,8 +33,7 @@ end
 # Minimal JSON serialiser (no external dependencies)
 # ---------------------------------------------------------------------------
 
-function _json_str(s::AbstractString)::String
-    buf = IOBuffer()
+function _write_json_str(buf::IO, s::AbstractString)
     write(buf, '"')
     for c in s
         if c == '"'
@@ -58,31 +57,122 @@ function _json_str(s::AbstractString)::String
         end
     end
     write(buf, '"')
+end
+
+function _json_str(s::AbstractString)::String
+    buf = IOBuffer()
+    _write_json_str(buf, s)
     return String(take!(buf))
 end
 
-function _item_to_json(item::Dict{String, Any})::String
-    s = "{\"name\":$(_json_str(item["name"]))," *
-        "\"kind\":$(_json_str(item["kind"]))," *
-        "\"type\":$(_json_str(item["type"]))," *
-        "\"value\":$(_json_str(item["value"]))," *
-        "\"expr\":$(_json_str(item["expr"]))"
+function _write_item_json(buf::IO, item::Dict{String, Any})
+    write(buf, "{\"name\":")
+    _write_json_str(buf, get(item, "name", ""))
+    write(buf, ",\"kind\":")
+    _write_json_str(buf, get(item, "kind", ""))
+    write(buf, ",\"type\":")
+    _write_json_str(buf, get(item, "type", ""))
+    write(buf, ",\"value\":")
+    _write_json_str(buf, get(item, "value", ""))
+    write(buf, ",\"expr\":")
+    _write_json_str(buf, get(item, "expr", ""))
     if haskey(item, "children")
         children = item["children"]::Vector{Dict{String, Any}}
-        child_strs = String[]
-        for c in children
-            push!(child_strs, _item_to_json(c))
+        write(buf, ",\"children\":[")
+        for (i, c) in enumerate(children)
+            _write_item_json(buf, c)
+            i < length(children) && write(buf, ',')
         end
-        s *= ",\"children\":[" * join(child_strs, ",") * "]"
+        write(buf, ']')
     end
-    s *= "}"
-    return s
+    write(buf, '}')
 end
 
-function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
-    children = Dict{String, Any}[]
-    T = typeof(val)
+function _item_to_json(item::Dict{String, Any})::String
+    buf = IOBuffer()
+    _write_item_json(buf, item)
+    return String(take!(buf))
+end
 
+# ---------------------------------------------------------------------------
+# Data-Oriented Design (DoD) Columnar Workspace Representation
+# ---------------------------------------------------------------------------
+
+struct WorkspaceTable
+    names::Vector{String}
+    kinds::Vector{String}
+    types::Vector{String}
+    values::Vector{String}
+    exprs::Vector{String}
+    modules::Vector{String}
+    depths::Vector{Int32}
+    parent_indices::Vector{Int32}
+    has_children::Vector{Bool}
+end
+
+function WorkspaceTable()
+    return WorkspaceTable(
+        String[],
+        String[],
+        String[],
+        String[],
+        String[],
+        String[],
+        Int32[],
+        Int32[],
+        Bool[]
+    )
+end
+
+function Base.empty!(t::WorkspaceTable)
+    empty!(t.names)
+    empty!(t.kinds)
+    empty!(t.types)
+    empty!(t.values)
+    empty!(t.exprs)
+    empty!(t.modules)
+    empty!(t.depths)
+    empty!(t.parent_indices)
+    empty!(t.has_children)
+    return t
+end
+
+function _add_entry!(
+    t::WorkspaceTable,
+    name::String,
+    kind::String,
+    type_str::String,
+    value_str::String,
+    expr_str::String,
+    mod_str::String,
+    depth::Int,
+    parent_idx::Int,
+    has_children::Bool
+)::Int
+    push!(t.names, name)
+    push!(t.kinds, kind)
+    push!(t.types, type_str)
+    push!(t.values, value_str)
+    push!(t.exprs, expr_str)
+    push!(t.modules, mod_str)
+    push!(t.depths, Int32(depth))
+    push!(t.parent_indices, Int32(parent_idx))
+    push!(t.has_children, has_children)
+    return length(t.names)
+end
+
+const _shared_workspace_table = Ref{WorkspaceTable}(WorkspaceTable())
+
+function _collect_children_dod!(
+    t::WorkspaceTable,
+    val,
+    parent_expr::String,
+    mod_name::String,
+    depth::Int,
+    parent_idx::Int
+)
+    depth > 5 && return
+    T = typeof(val)
     try
         type_name_str = string(T)
         # 1. DataFrames / Tables.jl interface
@@ -94,90 +184,127 @@ function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
                     c_str = string(cname)
                     c_col = val[!, Symbol(cname)]
                     c_expr = parent_expr * "[!, :" * c_str * "]"
-                    push!(children, Dict{String, Any}(
-                        "name" => ":" * c_str,
-                        "kind" => "variable",
-                        "type" => string(typeof(c_col)) * " (" * string(r_count) * " rows)",
-                        "value" => _value_preview(c_col),
-                        "expr" => c_expr
-                    ))
+                    _add_entry!(
+                        t,
+                        ":" * c_str,
+                        "variable",
+                        string(typeof(c_col)) * " (" * string(r_count) * " rows)",
+                        _value_preview(c_col),
+                        c_expr,
+                        mod_name,
+                        depth,
+                        parent_idx,
+                        false
+                    )
                 end
             catch
             end
-            return children
+            return
         end
 
         # 2. Dictionaries
         if val isa AbstractDict
+            count = 0
             for (k, v) in val
-                length(children) >= 20 && break
+                count >= 20 && break
                 k_str = string(k)
                 k_expr = parent_expr * "[" * repr(k) * "]"
-                push!(children, Dict{String, Any}(
-                    "name" => k_str,
-                    "kind" => "variable",
-                    "type" => string(typeof(v)),
-                    "value" => _value_preview(v),
-                    "expr" => k_expr
-                ))
+                _add_entry!(
+                    t,
+                    k_str,
+                    "variable",
+                    string(typeof(v)),
+                    _value_preview(v),
+                    k_expr,
+                    mod_name,
+                    depth,
+                    parent_idx,
+                    false
+                )
+                count += 1
             end
         # 3. 1D Arrays
         elseif val isa AbstractArray && ndims(val) == 1
             for i in 1:min(length(val), 20)
-                push!(children, Dict{String, Any}(
-                    "name" => "[$i]",
-                    "kind" => "variable",
-                    "type" => string(typeof(val[i])),
-                    "value" => _value_preview(val[i]),
-                    "expr" => parent_expr * "[$i]"
-                ))
+                _add_entry!(
+                    t,
+                    "[$i]",
+                    "variable",
+                    string(typeof(val[i])),
+                    _value_preview(val[i]),
+                    parent_expr * "[$i]",
+                    mod_name,
+                    depth,
+                    parent_idx,
+                    false
+                )
             end
         # 4. 2D Matrices / Arrays
         elseif val isa AbstractArray && ndims(val) == 2
             rows, cols = size(val)
             for i in 1:min(rows, 5)
                 for j in 1:min(cols, 5)
-                    push!(children, Dict{String, Any}(
-                        "name" => "[$i, $j]",
-                        "kind" => "variable",
-                        "type" => string(eltype(val)),
-                        "value" => _value_preview(val[i, j]),
-                        "expr" => parent_expr * "[$i, $j]"
-                    ))
+                    _add_entry!(
+                        t,
+                        "[$i, $j]",
+                        "variable",
+                        string(eltype(val)),
+                        _value_preview(val[i, j]),
+                        parent_expr * "[$i, $j]",
+                        mod_name,
+                        depth,
+                        parent_idx,
+                        false
+                    )
                 end
             end
-        # 5. Multidimensional Arrays (ndims > 2)
+        # 5. Multidimensional Arrays
         elseif val isa AbstractArray && ndims(val) > 2
-            push!(children, Dict{String, Any}(
-                "name" => "[dimensions]",
-                "kind" => "variable",
-                "type" => "Tuple",
-                "value" => string(size(val)),
-                "expr" => "size(" * parent_expr * ")"
-            ))
+            _add_entry!(
+                t,
+                "[dimensions]",
+                "variable",
+                "Tuple",
+                string(size(val)),
+                "size(" * parent_expr * ")",
+                mod_name,
+                depth,
+                parent_idx,
+                false
+            )
         # 6. Tuples and NamedTuples
         elseif val isa NamedTuple
             for name in keys(val)
                 v = val[name]
                 name_str = string(name)
-                push!(children, Dict{String, Any}(
-                    "name" => name_str,
-                    "kind" => "variable",
-                    "type" => string(typeof(v)),
-                    "value" => _value_preview(v),
-                    "expr" => parent_expr * "." * name_str
-                ))
+                _add_entry!(
+                    t,
+                    name_str,
+                    "variable",
+                    string(typeof(v)),
+                    _value_preview(v),
+                    parent_expr * "." * name_str,
+                    mod_name,
+                    depth,
+                    parent_idx,
+                    false
+                )
             end
         elseif val isa Tuple
             for (i, v) in enumerate(val)
                 i > 20 && break
-                push!(children, Dict{String, Any}(
-                    "name" => "[$i]",
-                    "kind" => "variable",
-                    "type" => string(typeof(v)),
-                    "value" => _value_preview(v),
-                    "expr" => parent_expr * "[$i]"
-                ))
+                _add_entry!(
+                    t,
+                    "[$i]",
+                    "variable",
+                    string(typeof(v)),
+                    _value_preview(v),
+                    parent_expr * "[$i]",
+                    mod_name,
+                    depth,
+                    parent_idx,
+                    false
+                )
             end
         # 7. Arbitrary composite structs
         elseif !isprimitivetype(T) && T !== Module && T !== Function && T !== DataType && T !== UnionAll
@@ -185,47 +312,113 @@ function _get_children(val, parent_expr::String)::Vector{Dict{String, Any}}
             for f in fns
                 f_str = string(f)
                 f_val = try getfield(val, f) catch; continue end
-                push!(children, Dict{String, Any}(
-                    "name" => f_str,
-                    "kind" => "variable",
-                    "type" => string(typeof(f_val)),
-                    "value" => _value_preview(f_val),
-                    "expr" => parent_expr * "." * f_str
-                ))
+                _add_entry!(
+                    t,
+                    f_str,
+                    "variable",
+                    string(typeof(f_val)),
+                    _value_preview(f_val),
+                    parent_expr * "." * f_str,
+                    mod_name,
+                    depth,
+                    parent_idx,
+                    false
+                )
             end
         end
     catch
     end
-    return children
 end
 
-function _serialize(modules_data::Vector, packages_data::Vector)::String
+function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
     buf = IOBuffer()
     write(buf, "{\"timestamp\":")
     write(buf, string(round(Int, time())))
-    write(buf, ",\"modules\":[")
-    for (i, mod_data) in enumerate(modules_data)
-        write(buf, "{\"name\":")
-        write(buf, _json_str(mod_data[:name]))
-        write(buf, ",\"items\":[")
-        items = mod_data[:items]
-        for (j, item) in enumerate(items)
-            write(buf, _item_to_json(item))
-            j < length(items) && write(buf, ",")
-        end
-        write(buf, "]}")
-        i < length(modules_data) && write(buf, ",")
+    write(buf, ",\"columns\":{")
+
+    write(buf, "\"names\":[")
+    for (i, n) in enumerate(t.names)
+        _write_json_str(buf, n)
+        i < length(t.names) && write(buf, ',')
     end
-    write(buf, "],\"packages\":[")
+
+    write(buf, "],\"kinds\":[")
+    for (i, k) in enumerate(t.kinds)
+        _write_json_str(buf, k)
+        i < length(t.kinds) && write(buf, ',')
+    end
+
+    write(buf, "],\"types\":[")
+    for (i, tp) in enumerate(t.types)
+        _write_json_str(buf, tp)
+        i < length(t.types) && write(buf, ',')
+    end
+
+    write(buf, "],\"values\":[")
+    for (i, v) in enumerate(t.values)
+        _write_json_str(buf, v)
+        i < length(t.values) && write(buf, ',')
+    end
+
+    write(buf, "],\"exprs\":[")
+    for (i, e) in enumerate(t.exprs)
+        _write_json_str(buf, e)
+        i < length(t.exprs) && write(buf, ',')
+    end
+
+    write(buf, "],\"modules\":[")
+    for (i, m) in enumerate(t.modules)
+        _write_json_str(buf, m)
+        i < length(t.modules) && write(buf, ',')
+    end
+
+    write(buf, "],\"depths\":[")
+    for (i, d) in enumerate(t.depths)
+        write(buf, string(d))
+        i < length(t.depths) && write(buf, ',')
+    end
+
+    write(buf, "],\"parent_indices\":[")
+    for (i, p) in enumerate(t.parent_indices)
+        write(buf, string(p))
+        i < length(t.parent_indices) && write(buf, ',')
+    end
+
+    write(buf, "],\"has_children\":[")
+    for (i, hc) in enumerate(t.has_children)
+        write(buf, hc ? "true" : "false")
+        i < length(t.has_children) && write(buf, ',')
+    end
+
+    write(buf, "]},\"packages\":[")
     for (i, pkg) in enumerate(packages_data)
-        write(buf, "{\"name\":$(_json_str(pkg["name"])),\"version\":$(_json_str(pkg["version"]))}")
-        i < length(packages_data) && write(buf, ",")
+        write(buf, "{\"name\":")
+        _write_json_str(buf, get(pkg, "name", ""))
+        write(buf, ",\"version\":")
+        _write_json_str(buf, get(pkg, "version", ""))
+        write(buf, '}')
+        i < length(packages_data) && write(buf, ',')
     end
     write(buf, "]}")
     return String(take!(buf))
 end
 
+function _serialize(modules_data::Vector, packages_data::Vector)::String
+    return _serialize_dod(_shared_workspace_table[], packages_data)
+end
+
+const _cached_pkgs = Ref{Vector{Dict{String, String}}}(Dict{String, String}[])
+const _last_pkg_mtime = Ref{Float64}(0.0)
+
 function _get_packages()::Vector{Dict{String, String}}
+    proj_dir = _get_project_dir()
+    proj_file = joinpath(proj_dir, "Project.toml")
+    mtime_proj = isfile(proj_file) ? mtime(proj_file) : 0.0
+
+    if !isempty(_cached_pkgs[]) && mtime_proj == _last_pkg_mtime[]
+        return _cached_pkgs[]
+    end
+
     pkgs = Dict{String, String}[]
     try
         for (name, uuid) in Pkg.project().dependencies
@@ -239,9 +432,12 @@ function _get_packages()::Vector{Dict{String, String}}
             end
             push!(pkgs, Dict("name" => name, "version" => ver))
         end
+        sort!(pkgs; by = x -> x["name"])
+        _cached_pkgs[] = pkgs
+        _last_pkg_mtime[] = mtime_proj
     catch e
     end
-    return sort!(pkgs; by = x -> x["name"])
+    return _cached_pkgs[]
 end
 
 # ---------------------------------------------------------------------------
@@ -267,9 +463,14 @@ function _skip_name(s::String)::Bool
 end
 
 function _value_preview(val)::String
+    val isa Number && return string(val)
+    val isa Bool && return string(val)
+    val isa Symbol && return string(val)
+    if val isa AbstractString
+        return length(val) > 60 ? repr(val[1:min(end, 57)]) * "…" : repr(val)
+    end
     return try
         s = sprint((io, x) -> Base.invokelatest(show, io, x), val; context = IOContext(devnull, :limit => true, :compact => true))
-        # strip newlines and limit length
         s = replace(s, '\n' => ' ')
         length(s) > 60 ? s[1:60] * "…" : s
     catch
@@ -277,18 +478,17 @@ function _value_preview(val)::String
     end
 end
 
-function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
-    items = Dict{String, Any}[]
-    for sym in Base.invokelatest(names, mod; all = all, imported = false)
+function _collect_module_items_dod!(t::WorkspaceTable, mod::Module, mod_name::String, all::Bool)
+    syms = Base.invokelatest(names, mod; all = all, imported = false)
+    candidates = Tuple{Symbol, String, Any, String}[]
+    for sym in syms
         name = string(sym)
         _skip_name(name) && continue
-
         val = try
             Base.invokelatest(getfield, mod, sym)
         catch
             continue
         end
-
         kind = if isa(val, Function)
             "function"
         elseif isa(val, Module)
@@ -298,12 +498,14 @@ function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
         else
             "variable"
         end
+        kind == "module" && continue
+        push!(candidates, (sym, name, val, kind))
+    end
 
-        kind == "module" && continue  # modules shown at top level
+    sort!(candidates; by = x -> (x[4] == "variable" ? 0 : 1, x[2]))
 
+    for (_, name, val, kind) in candidates
         type_str = string(typeof(val))
-
-        # Only preview values in Main or simple types in other modules to avoid stack overflows
         value_str = ""
         if kind == "variable"
             if all || isa(val, Number) || isa(val, AbstractString) || isa(val, Symbol) || isa(val, Bool)
@@ -320,26 +522,25 @@ function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
             value_str = "(type)"
         end
 
-        item_expr = (mod == Main) ? name : (string(mod) * "." * name)
-
-        item = Dict{String, Any}(
-            "name" => name,
-            "kind" => kind,
-            "type" => type_str,
-            "value" => value_str,
-            "expr" => item_expr
+        item_expr = (mod == Main) ? name : (mod_name * "." * name)
+        
+        has_kids = (kind == "variable") && (
+            val isa AbstractDict || 
+            (val isa AbstractArray && length(val) > 0) || 
+            val isa Tuple || 
+            val isa NamedTuple || 
+            (!isprimitivetype(typeof(val)) && typeof(val) !== Module && typeof(val) !== Function && typeof(val) !== DataType && typeof(val) !== UnionAll)
         )
 
-        if kind == "variable"
-            children = _get_children(val, item_expr)
-            if !isempty(children)
-                item["children"] = children
-            end
+        entry_idx = _add_entry!(t, name, kind, type_str, value_str, item_expr, mod_name, 0, -1, has_kids)
+        if has_kids
+            _collect_children_dod!(t, val, item_expr, mod_name, 1, entry_idx)
         end
-
-        push!(items, item)
     end
-    return sort!(items; by = x -> (x["kind"] == "variable" ? 0 : 1, x["name"]))
+end
+
+function _get_items(mod::Module, all::Bool)::Vector{Dict{String, Any}}
+    return Dict{String, Any}[]
 end
 
 function inspect_var(mod::Module, expr_str::String)
@@ -357,7 +558,7 @@ function inspect_var(mod::Module, expr_str::String)
     reset = "\e[0m"
 
     println("\n" * green * bold * "━"^60 * reset)
-    println(bold * "Variable:      " * reset * "$mod.$name_str")
+    println(bold * "Variable:      " * reset * "$mod.$expr_str")
     println(bold * "Type:          " * reset * "$(typeof(val))")
     if hasmethod(size, Tuple{typeof(val)})
         try
@@ -392,7 +593,7 @@ function inspect_var(mod::Module, expr_str::String)
         end
     end
 
-    # Search REPL history for creation/assignment
+    # Search REPL history for creation/assignment (read only last 64KB for speed)
     base_m = match(r"^[a-zA-Z_][a-zA-Z0-9_]*", expr_str)
     base_var_str = isnothing(base_m) ? expr_str : base_m.match
     sym = Symbol(base_var_str)
@@ -400,7 +601,13 @@ function inspect_var(mod::Module, expr_str::String)
     hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
     if isfile(hist_path)
         try
-            lines = readlines(hist_path)
+            sz = filesize(hist_path)
+            read_len = min(sz, 65536)
+            lines = open(hist_path, "r") do f
+                seek(f, sz - read_len)
+                read_len < sz && readline(f) # discard partial line
+                readlines(f)
+            end
             var_regex = Regex("\\b" * base_var_str * "\\b")
             found_cmd = ""
             current_block = String[]
@@ -443,16 +650,11 @@ function inspect_var(mod::Module, expr_str::String)
     return nothing
 end
 
-function _collect_state()::Vector
-    modules_data = []
+function _collect_state_dod!(t::WorkspaceTable)::WorkspaceTable
+    empty!(t)
 
     # 1. Main module — always first
-    push!(
-        modules_data, Dict(
-            :name => "Main",
-            :items => _get_items(Main, true),
-        )
-    )
+    _collect_module_items_dod!(t, Main, "Main", true)
 
     # 2. Collect modules explicitly loaded/imported in Main
     user_loaded_modules = Set{Module}()
@@ -471,20 +673,17 @@ function _collect_state()::Vector
     for (_, mod) in Base.loaded_modules
         name = string(mod)
         name in seen && continue
-
-        # Only show if the module was explicitly loaded/imported in Main
         if mod in user_loaded_modules
             push!(seen, name)
-            push!(
-                modules_data, Dict(
-                    :name => name,
-                    :items => _get_items(mod, false),
-                )
-            )
+            _collect_module_items_dod!(t, mod, name, false)
         end
     end
 
-    return modules_data
+    return t
+end
+
+function _collect_state()
+    return _collect_state_dod!(_shared_workspace_table[])
 end
 
 const HIST_START_POS = Ref{Int}(0)
@@ -662,6 +861,7 @@ const _running = Ref{Bool}(false)
 const _socket_clients = Set{Sockets.PipeEndpoint}()
 const _server_ref = Ref{Union{Sockets.PipeServer, Nothing}}(nothing)
 const _last_serialized_json = Ref{String}("")
+const _tui_pane_ref = Ref{String}("")
 
 function _start_socket_server()
     path = SOCKET_PATH[]
@@ -701,6 +901,18 @@ function _start_socket_server()
 end
 
 function _stop_socket_server()
+    # Notify all subscribers that jEMach has stopped and panels should close
+    stop_msg = "{\"event\":\"stop\",\"action\":\"close\"}\n"
+    for client in _socket_clients
+        try
+            if isopen(client)
+                write(client, stop_msg)
+                flush(client)
+            end
+        catch
+        end
+    end
+
     if !isnothing(_server_ref[])
         try close(_server_ref[]) catch; end
         _server_ref[] = nothing
@@ -714,14 +926,48 @@ function _stop_socket_server()
     end
 end
 
+function _close_tui_pane()
+    # 1. Close directly tracked tmux pane if opened by jEMach.start()
+    if !isempty(_tui_pane_ref[])
+        try
+            run(`tmux kill-pane -t $(_tui_pane_ref[])`)
+        catch
+        end
+        _tui_pane_ref[] = ""
+    end
+
+    # 2. Fallback: Search current tmux window for any pane running jl-assist or jl_tui.lua
+    if haskey(ENV, "TMUX")
+        try
+            out = read(`tmux list-panes -F "#{pane_id} #{pane_current_command}"`, String)
+            for line in split(strip(out), '\n')
+                parts = split(strip(line))
+                if length(parts) >= 2
+                    pid = parts[1]
+                    cmd = parts[2]
+                    if cmd == "luajit" || occursin("jl_tui", cmd) || occursin("jl-assist", cmd)
+                        run(`tmux kill-pane -t $pid`)
+                    end
+                end
+            end
+        catch
+        end
+    end
+end
+
 function publish_state()
     return try
-        state = _collect_state()
+        state = _collect_state_dod!(_shared_workspace_table[])
         pkgs = _get_packages()
-        json = _serialize(state, pkgs)
+        json = _serialize_dod(state, pkgs)
+
+        # Avoid redundant disk writes and network flooding if state has not changed
+        if json == _last_serialized_json[]
+            return
+        end
         _last_serialized_json[] = json
 
-        # Write to file (fallback / legacy)
+        # Write to file (fallback / legacy) atomically
         temp_file = STATE_FILE[] * ".tmp"
         open(temp_file, "w") do f
             write(f, json)
@@ -777,8 +1023,9 @@ function start(; split::Bool = true)
         end
 
         try
-            run(`tmux split-window -h -l 80 $assist_path`)
-            println("🚀 tmux TUI split opened!")
+            pane_id = strip(read(`tmux split-window -P -F "#{pane_id}" -h -l 80 $assist_path`, String))
+            _tui_pane_ref[] = pane_id
+            println("🚀 tmux TUI split opened ($pane_id)!")
         catch e
             @warn "Failed to open tmux TUI pane (are you inside tmux?)" exception = e
         end
@@ -789,7 +1036,71 @@ end
 function stop()
     _running[] = false
     _stop_socket_server()
-    return @info "jEMach Watcher stopping after current cycle…"
+    _close_tui_pane()
+    return @info "jEMach Watcher stopped and right panel closed."
+end
+
+# ---------------------------------------------------------------------------
+# Zero-Overhead FFI Hot-Reloading via JuliaZigCompiler
+# ---------------------------------------------------------------------------
+
+function _hot_reload_callback(file_path::String, source::String)
+    @info "[jEMach Hot-Reload] File changed: $file_path"
+    try
+        # Evaluate the changed file in the Main module or attempt to guess the module
+        expr = Meta.parse("begin\n" * source * "\nend")
+        Base.invokelatest(Core.eval, Main, expr)
+        @info "[jEMach Hot-Reload] Successfully reloaded into Main."
+    catch e
+        @error "[jEMach Hot-Reload] Error evaluating $file_path" exception=(e, catch_backtrace())
+    end
+end
+
+function enable_hot_reload(proj_dir::String = _get_project_dir())
+    # Try to load JuliaZigCompiler
+    CompilerModule = try
+        # Try to find it in the current environment
+        Base.require(Base.PkgId(Base.UUID("918df9c8-d8bb-4a5e-b2d9-183498845fc8"), "JuliaZigCompiler"))
+    catch
+        try
+            # Fallback to direct include if running locally from the user's workspace
+            compiler_path = joinpath(homedir(), "code", "julia-zig-jit", "julia_package", "JuliaZigCompiler", "src", "JuliaZigCompiler.jl")
+            if isfile(compiler_path)
+                include(compiler_path)
+                Main.JuliaZigCompiler
+            else
+                nothing
+            end
+        catch
+            nothing
+        end
+    end
+
+    if isnothing(CompilerModule)
+        @error "JuliaZigCompiler is not available. Cannot enable Zero-Overhead FFI Hot-Reloading."
+        return
+    end
+
+    @info "Starting jEMach Zero-Overhead FFI Hot-Reloading for project: $proj_dir"
+
+    # Recursively find all .jl files in the src/ directory of the project
+    src_dir = joinpath(proj_dir, "src")
+    if !isdir(src_dir)
+        src_dir = proj_dir
+    end
+
+    watched_count = 0
+    for (root, _, files) in walkdir(src_dir)
+        for file in files
+            if endswith(file, ".jl")
+                path = joinpath(root, file)
+                Base.invokelatest(CompilerModule.watch_file, path, _hot_reload_callback)
+                watched_count += 1
+            end
+        end
+    end
+    
+    @info "Registered $watched_count files for instantaneous FFI Hot-Reload."
 end
 
 function status()

@@ -101,6 +101,7 @@ local socket_path = "/tmp/jemach_" .. safe_name .. ".sock"
 local socket_fd = -1
 local last_connect_try = 0
 local socket_buffer = ""
+local dirty = true
 
 local function try_connect_socket()
 	if socket_fd >= 0 then
@@ -137,12 +138,13 @@ local function handle_socket_read()
 	if not n or n <= 0 then
 		ffi.C.close(socket_fd)
 		socket_fd = -1
-		return
+		return nil
 	end
 
 	local chunk = ffi.string(buf, n)
 	socket_buffer = socket_buffer .. chunk
 
+	local should_quit = false
 	while true do
 		local nl = socket_buffer:find("\n")
 		if not nl then
@@ -153,10 +155,19 @@ local function handle_socket_read()
 
 		local ok, parsed = pcall(json_parse, line)
 		if ok and parsed then
-			state = parsed
-			last_state_ts = os.time()
+			if parsed.action == "close" or parsed.event == "stop" then
+				should_quit = true
+			else
+				state = parsed
+				last_state_ts = os.time()
+				dirty = true
+			end
 		end
 	end
+	if should_quit then
+		return "quit"
+	end
+	return nil
 end
 
 -- Read a single key-press (or escape sequence) with a timeout in ms.
@@ -183,7 +194,10 @@ local function read_key(timeout_ms)
 	end
 
 	if socket_fd >= 0 and fd_set_isset(fds, socket_fd) then
-		handle_socket_read()
+		local sres = handle_socket_read()
+		if sres == "quit" then
+			return "q"
+		end
 	end
 
 	if fd_set_isset(fds, STDIN) then
@@ -439,18 +453,18 @@ end
 
 local function load_state()
 	if socket_fd >= 0 then
-		return
+		return false
 	end
 
 	local mt = file_mtime(STATE_FILE)
-	if mt == last_mtime then
-		return
+	if mt == 0 or mt == last_mtime then
+		return false
 	end
 	last_mtime = mt
 
 	local f = io.open(STATE_FILE, "r")
 	if not f then
-		return
+		return false
 	end
 	local content = f:read("*a")
 	f:close()
@@ -459,7 +473,10 @@ local function load_state()
 	if ok and parsed then
 		state = parsed
 		last_state_ts = os.time()
+		dirty = true
+		return true
 	end
+	return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -491,11 +508,86 @@ local function build_display_rows()
 		return
 	end
 
-	if not state or not state.modules then
+	if not state or (not state.modules and not state.columns) then
 		display_rows[1] = {
 			kind = "msg",
 			text = 'Waiting for Julia watcher…  (include("scripts/jl_watcher.jl"))',
 		}
+		return
+	end
+
+	if state.columns then
+		local cols = state.columns
+		local count = #(cols.names or {})
+		local skip_until_depth = -1
+		local current_mod = nil
+
+		for i = 1, count do
+			local mname = (cols.modules and cols.modules[i]) or "Main"
+			if mname ~= current_mod then
+				current_mod = mname
+				if not hidden[mname] then
+					local is_collapsed = collapsed[mname]
+					local icon = is_collapsed and "▶" or "▼"
+					table.insert(display_rows, {
+						kind = "module",
+						name = mname,
+						collapsed = is_collapsed,
+						icon = icon,
+					})
+				end
+			end
+
+			if hidden[current_mod] or collapsed[current_mod] then
+				goto continue
+			end
+
+			local depth = (cols.depths and cols.depths[i]) or 0
+			if skip_until_depth >= 0 then
+				if depth > skip_until_depth then
+					goto continue
+				else
+					skip_until_depth = -1
+				end
+			end
+
+			local iname = cols.names[i] or "?"
+			local key = current_mod .. "/" .. ((cols.exprs and cols.exprs[i]) or iname)
+			if hidden[key] then
+				goto continue
+			end
+
+			local has_children = cols.has_children and cols.has_children[i] or false
+			local is_collapsed = collapsed[key]
+			local icon = ""
+			if has_children then
+				icon = is_collapsed and "▶" or "▼"
+			end
+
+			table.insert(display_rows, {
+				kind = "item",
+				module_name = current_mod,
+				name = iname,
+				item_kind = (cols.kinds and cols.kinds[i]) or "variable",
+				item_type = (cols.types and cols.types[i]) or "",
+				value = (cols.values and cols.values[i]) or "",
+				expr = (cols.exprs and cols.exprs[i]) or iname,
+				depth = depth,
+				path = key,
+				has_children = has_children,
+				icon = icon,
+			})
+
+			if has_children and is_collapsed then
+				skip_until_depth = depth
+			end
+
+			::continue::
+		end
+
+		if #display_rows == 0 then
+			display_rows[1] = { kind = "msg", text = "No variables in workspace." }
+		end
 		return
 	end
 
@@ -912,25 +1004,39 @@ local function main()
 		load_state()
 		build_display_rows()
 		clamp_cursor()
+		render(term_rows, term_cols)
+		dirty = false
 
 		while true do
 			-- Poll terminal size every ~20 cycles (~2s)
 			resize_counter = resize_counter + 1
 			if resize_counter >= 20 then
 				resize_counter = 0
-				term_rows, term_cols = get_terminal_size()
+				local new_rows, new_cols = get_terminal_size()
+				if new_rows ~= term_rows or new_cols ~= term_cols then
+					term_rows, term_cols = new_rows, new_cols
+					dirty = true
+				end
 			end
 
-			load_state()
-			build_display_rows()
-			clamp_cursor()
+			if load_state() then
+				dirty = true
+			end
 
-			render(term_rows, term_cols)
+			if dirty then
+				build_display_rows()
+				clamp_cursor()
+				render(term_rows, term_cols)
+				dirty = false
+			end
 
 			local key = read_key(REFRESH_MS)
-			local result = handle_key(key, term_rows, term_cols)
-			if result == "quit" then
-				break
+			if key then
+				dirty = true
+				local result = handle_key(key, term_rows, term_cols)
+				if result == "quit" then
+					break
+				end
 			end
 		end
 	end)
