@@ -12,6 +12,8 @@ import Dates
 import Pkg
 import Sockets
 
+export make_procedure, record, record_stop, run_procedure, list_procedures, get_recent_commands
+
 const STATE_FILE = Ref{String}("/tmp/jl_tui_state.json")
 const SOCKET_PATH = Ref{String}("/tmp/jemach.sock")
 const UPDATE_INTERVAL = 2.0  # seconds between state refreshes
@@ -330,6 +332,465 @@ function _collect_children_dod!(
     end
 end
 
+# ---------------------------------------------------------------------------
+# Procedure Engine & REPL History
+# ---------------------------------------------------------------------------
+
+mutable struct ProcedureInfo
+    name::Symbol
+    signature::String
+    file::String
+    doc::String
+    code::String
+    last_run_time_ms::Float64
+    last_run_alloc_bytes::Int
+    last_run_status::Symbol # :ok, :error, :never
+    last_run_at::String
+end
+
+const _procedures = Dict{Symbol, ProcedureInfo}()
+const _recording = Ref{Bool}(false)
+const _record_name = Ref{Symbol}(:proc)
+const _record_start_idx = Ref{Int}(0)
+const HIST_START_POS = Ref{Int}(0)
+
+function _is_valid_user_cmd(cmd::AbstractString)::Bool
+    s = strip(cmd)
+    isempty(s) && return false
+    if occursin("jEMach.", s) || occursin("save_clean_session", s) ||
+       occursin("inspect_var", s) || occursin("publish_state", s)
+        return false
+    end
+    return true
+end
+
+function get_recent_commands(; limit::Int = 50, session_only::Bool = false)::Vector{String}
+    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
+    !isfile(hist_path) && return String[]
+
+    sz = filesize(hist_path)
+    pos = 0
+    if session_only && HIST_START_POS[] > 0
+        pos = min(HIST_START_POS[], sz)
+    else
+        read_len = min(sz, 131072)
+        pos = sz - read_len
+    end
+
+    content = try
+        open(hist_path, "r") do f
+            seek(f, pos)
+            pos > 0 && readline(f)
+            read(f, String)
+        end
+    catch
+        return String[]
+    end
+
+    commands = String[]
+    current_block = String[]
+
+    for line in split(content, '\n')
+        if startswith(line, "# time:")
+            if !isempty(current_block)
+                cmd = join(current_block, "\n")
+                _is_valid_user_cmd(cmd) && push!(commands, cmd)
+                empty!(current_block)
+            end
+        elseif !startswith(line, "#")
+            clean_line = startswith(line, '\t') ? line[2:end] : line
+            push!(current_block, clean_line)
+        end
+    end
+    if !isempty(current_block)
+        cmd = join(current_block, "\n")
+        _is_valid_user_cmd(cmd) && push!(commands, cmd)
+    end
+
+    if length(commands) > limit
+        return commands[(end - limit + 1):end]
+    else
+        return commands
+    end
+end
+
+function get_session_commands()::Vector{String}
+    return get_recent_commands(session_only = true)
+end
+
+function _load_procedures!()
+    proc_dir = joinpath(_get_project_dir(), "procedures")
+    !isdir(proc_dir) && return _procedures
+
+    for file in readdir(proc_dir)
+        !endswith(file, ".jl") && continue
+        filepath = joinpath(proc_dir, file)
+        content = try read(filepath, String) catch; continue end
+
+        parsed = try Meta.parse("begin\n" * content * "\nend") catch; continue end
+        doc_str = ""
+        sig_str = ""
+        func_name = Symbol(splitext(file)[1])
+
+        for a in parsed.args
+            if a isa Expr && a.head == :macrocall && length(a.args) >= 4 && a.args[1] == GlobalRef(Core, Symbol("@doc"))
+                doc_str = string(a.args[3])
+                fexpr = a.args[4]
+                if fexpr isa Expr && fexpr.head == :function && !isempty(fexpr.args)
+                    sig_str = string(fexpr.args[1])
+                    fsym = fexpr.args[1]
+                    if fsym isa Expr && fsym.head == :call
+                        func_name = Symbol(fsym.args[1])
+                    end
+                end
+            elseif a isa Expr && a.head == :function && !isempty(a.args)
+                sig_str = string(a.args[1])
+                fsym = a.args[1]
+                if fsym isa Expr && fsym.head == :call
+                    func_name = Symbol(fsym.args[1])
+                end
+            end
+        end
+
+        if isempty(sig_str)
+            sig_str = string(func_name) * "()"
+        end
+
+        rel_path = relpath(filepath, _get_project_dir())
+        if !haskey(_procedures, func_name)
+            _procedures[func_name] = ProcedureInfo(
+                func_name,
+                sig_str,
+                rel_path,
+                strip(doc_str),
+                content,
+                0.0,
+                0,
+                :never,
+                "-"
+            )
+        else
+            p = _procedures[func_name]
+            p.signature = sig_str
+            p.doc = strip(doc_str)
+            p.code = content
+            p.file = rel_path
+        end
+    end
+    return _procedures
+end
+
+function _is_global_or_type(sym::Symbol)::Bool
+    for m in (Main, Base, Core)
+        if isdefined(m, sym)
+            try
+                v = getfield(m, sym)
+                if v isa Function || v isa DataType || v isa UnionAll || v isa Module
+                    return true
+                end
+            catch
+            end
+        end
+    end
+    return false
+end
+
+function _collect_ast_symbols!(ex, assigned::Set{Symbol}, referenced::Set{Symbol})
+    if ex isa Symbol
+        push!(referenced, ex)
+    elseif ex isa Expr
+        if ex.head == :(=)
+            lhs = ex.args[1]
+            if lhs isa Symbol
+                push!(assigned, lhs)
+            elseif lhs isa Expr && lhs.head == :tuple
+                for a in lhs.args
+                    a isa Symbol && push!(assigned, a)
+                end
+            end
+            if length(ex.args) >= 2
+                _collect_ast_symbols!(ex.args[2], assigned, referenced)
+            end
+        elseif ex.head == :call
+            for a in ex.args
+                _collect_ast_symbols!(a, assigned, referenced)
+            end
+        elseif ex.head == :macrocall
+            for i in 2:length(ex.args)
+                _collect_ast_symbols!(ex.args[i], assigned, referenced)
+            end
+        elseif ex.head == :.
+            _collect_ast_symbols!(ex.args[1], assigned, referenced)
+        else
+            for a in ex.args
+                _collect_ast_symbols!(a, assigned, referenced)
+            end
+        end
+    end
+end
+
+function _default_param_str(sym::Symbol)::Tuple{String, Bool}
+    if isdefined(Main, sym)
+        val = try getfield(Main, sym) catch; nothing end
+        if !isnothing(val)
+            try
+                rep = repr(val)
+                if length(rep) <= 80 && !occursin('\n', rep)
+                    return (string(sym) * " = " * rep, true)
+                else
+                    return (string(sym) * " = Main." * string(sym), true)
+                end
+            catch
+                return (string(sym) * " = Main." * string(sym), true)
+            end
+        end
+    end
+    return (string(sym), false)
+end
+
+function make_procedure(
+    name::Union{Symbol, AbstractString};
+    last::Int = 0,
+    indices::Vector{Int} = Int[],
+    commands::Vector{String} = String[],
+    params::Vector{Symbol} = Symbol[],
+    doc::String = "",
+    save::Bool = true
+)
+    proc_name = Symbol(name)
+    all_cmds = get_recent_commands(limit = 100)
+
+    cmds = String[]
+    if !isempty(commands)
+        cmds = copy(commands)
+    elseif !isempty(indices)
+        sort!(indices)
+        cmds = [all_cmds[i] for i in indices if 1 <= i <= length(all_cmds)]
+    elseif last > 0
+        cmds = all_cmds[max(1, end - last + 1):end]
+    else
+        cmds = all_cmds[max(1, end - 4):end]
+    end
+
+    cmds = filter(c -> !isempty(strip(c)) && !occursin("make_procedure", c), cmds)
+    if isempty(cmds)
+        @warn "No commands found to create procedure '$proc_name'"
+        return nothing
+    end
+
+    assigned = Set{Symbol}()
+    referenced = Set{Symbol}()
+    parsed_exprs = Expr[]
+
+    for cmd in cmds
+        ex = try Meta.parse("begin\n" * cmd * "\nend") catch; nothing end
+        if !isnothing(ex)
+            push!(parsed_exprs, ex)
+            _collect_ast_symbols!(ex, assigned, referenced)
+        end
+    end
+
+    free_syms = setdiff(referenced, assigned)
+    detected_params = filter(s -> !startswith(string(s), "@") && !_is_global_or_type(s), collect(free_syms))
+
+    final_params = !isempty(params) ? params : sort(detected_params, by = string)
+
+    required_params = String[]
+    default_params = String[]
+    for p in final_params
+        (p_str, has_default) = _default_param_str(p)
+        if has_default
+            push!(default_params, p_str)
+        else
+            push!(required_params, p_str)
+        end
+    end
+    sig_args = join(vcat(required_params, default_params), ", ")
+    func_sig = "$(proc_name)($sig_args)"
+
+    body_lines = String[]
+    for (i, cmd) in enumerate(cmds)
+        for line in split(cmd, '\n')
+            push!(body_lines, "    " * line)
+        end
+    end
+
+    last_ex = !isempty(parsed_exprs) ? parsed_exprs[end] : nothing
+    if !isnothing(last_ex) && last_ex isa Expr && last_ex.head == :block
+        sub_args = filter(a -> !(a isa LineNumberNode), last_ex.args)
+        if !isempty(sub_args)
+            leaf = sub_args[end]
+            if leaf isa Expr && leaf.head == :(=) && leaf.args[1] isa Symbol
+                push!(body_lines, "    return " * string(leaf.args[1]))
+            end
+        end
+    end
+
+    body_code = join(body_lines, "\n")
+    timestamp = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+    doc_text = isempty(doc) ? "Automated procedure extracted from Julia REPL." : doc
+
+    code = """
+# Generated by jEMach on $timestamp
+\"\"\"
+    $func_sig
+
+$doc_text
+\"\"\"
+function $func_sig
+$body_code
+end
+"""
+
+    if save
+        proc_dir = joinpath(_get_project_dir(), "procedures")
+        !isdir(proc_dir) && mkpath(proc_dir)
+        filepath = joinpath(proc_dir, string(proc_name) * ".jl")
+        write(filepath, code)
+
+        try
+            Base.include(Main, filepath)
+        catch e
+            @warn "Failed to evaluate generated procedure in Main" exception = e
+        end
+
+        rel_path = relpath(filepath, _get_project_dir())
+        _procedures[proc_name] = ProcedureInfo(
+            proc_name,
+            func_sig,
+            rel_path,
+            doc_text,
+            code,
+            0.0,
+            0,
+            :never,
+            "-"
+        )
+        publish_state()
+
+        green = "\e[32m\e[1m"
+        reset = "\e[0m"
+        cyan = "\e[36m"
+        println("\n" * green * "✓" * reset * " Procedure " * cyan * "$proc_name" * reset * " created in " * green * "$rel_path" * reset)
+        println("  Callable in REPL: " * cyan * "$func_sig" * reset * "\n")
+    end
+
+    return code
+end
+
+function record(name::Union{Symbol, AbstractString} = :proc)
+    _recording[] = true
+    _record_name[] = Symbol(name)
+    all_cmds = get_recent_commands(limit = 1000)
+    _record_start_idx[] = length(all_cmds) + 1
+    cyan = "\e[36m"
+    bold = "\e[1m"
+    reset = "\e[0m"
+    println(bold * cyan * "⏺ [jEMach] Recording procedure '$(_record_name[])'..." * reset)
+    println("  Execute your commands in the REPL. When done, call " * bold * "jEMach.record_stop()" * reset)
+    return nothing
+end
+
+function record_stop(; save::Bool = true)
+    if !_recording[]
+        println("No procedure recording is in progress.")
+        return nothing
+    end
+    _recording[] = false
+    all_cmds = get_recent_commands(limit = 1000)
+    start_i = min(_record_start_idx[], length(all_cmds))
+    cmds = (start_i <= length(all_cmds)) ? all_cmds[start_i:end] : String[]
+    cmds = filter(c -> !occursin("record_stop", c), cmds)
+    return make_procedure(_record_name[]; commands = cmds, save = save)
+end
+
+function run_procedure(name::Union{Symbol, AbstractString}, args...; kwargs...)
+    sym = Symbol(name)
+    proc_file = joinpath(_get_project_dir(), "procedures", string(sym) * ".jl")
+    if isfile(proc_file)
+        try
+            Base.include(Main, proc_file)
+        catch e
+            @warn "Failed to reload $proc_file" exception = e
+        end
+    end
+
+    if !isdefined(Main, sym)
+        error("Procedure '$sym' not found in Main or procedures/$sym.jl")
+    end
+    func = getfield(Main, sym)
+
+    println("▶ Running procedure '$sym'...")
+    t_res = @timed try
+        Base.invokelatest(func, args...; kwargs...)
+    catch e
+        e
+    end
+
+    val = t_res.value
+    is_err = val isa Exception
+    status_sym = is_err ? :error : :ok
+    time_ms = round(t_res.time * 1000, digits = 2)
+    alloc_bytes = t_res.bytes
+    now_str = Dates.format(Dates.now(), "HH:MM:SS")
+
+    if haskey(_procedures, sym)
+        p = _procedures[sym]
+        p.last_run_time_ms = time_ms
+        p.last_run_alloc_bytes = alloc_bytes
+        p.last_run_status = status_sym
+        p.last_run_at = now_str
+    else
+        _procedures[sym] = ProcedureInfo(
+            sym,
+            string(sym) * "()",
+            isfile(proc_file) ? relpath(proc_file, _get_project_dir()) : "",
+            "",
+            "",
+            time_ms,
+            alloc_bytes,
+            status_sym,
+            now_str
+        )
+    end
+    publish_state()
+
+    green = "\e[32m\e[1m"
+    red = "\e[31m\e[1m"
+    reset = "\e[0m"
+    if is_err
+        println(red * "✗ Procedure '$sym' failed in $(time_ms)ms" * reset)
+        throw(val)
+    else
+        println(green * "✓ Procedure '$sym' completed in $(time_ms)ms ($(Base.format_bytes(alloc_bytes)) allocated)" * reset)
+        return val
+    end
+end
+
+function list_procedures()
+    _load_procedures!()
+    if isempty(_procedures)
+        println("No procedures defined. Create one with jEMach.make_procedure(:name, last=5)")
+        return nothing
+    end
+    bold = "\e[1m"
+    cyan = "\e[36m"
+    green = "\e[32m"
+    yellow = "\e[33m"
+    red = "\e[31m"
+    reset = "\e[0m"
+
+    println(bold * "Available Procedures:" * reset)
+    for p in sort(collect(values(_procedures)), by = p -> string(p.name))
+        status_icon = (p.last_run_status == :ok) ? (green * "✓" * reset) :
+                      (p.last_run_status == :error) ? (red * "✗" * reset) : "○"
+        time_str = (p.last_run_status != :never) ? " ($(p.last_run_time_ms)ms, $(Base.format_bytes(p.last_run_alloc_bytes)))" : ""
+        println("  $status_icon " * cyan * bold * string(p.name) * reset * " → " * p.signature * yellow * time_str * reset)
+        println("    " * "\e[2m" * p.file * reset)
+    end
+    return nothing
+end
+
 function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
     buf = IOBuffer()
     write(buf, "{\"timestamp\":")
@@ -398,6 +859,38 @@ function _serialize_dod(t::WorkspaceTable, packages_data::Vector)::String
         _write_json_str(buf, get(pkg, "version", ""))
         write(buf, '}')
         i < length(packages_data) && write(buf, ',')
+    end
+
+    write(buf, "],\"procedures\":[")
+    proc_list = sort(collect(values(_procedures)), by = p -> string(p.name))
+    for (i, p) in enumerate(proc_list)
+        write(buf, "{\"name\":")
+        _write_json_str(buf, string(p.name))
+        write(buf, ",\"signature\":")
+        _write_json_str(buf, p.signature)
+        write(buf, ",\"file\":")
+        _write_json_str(buf, p.file)
+        write(buf, ",\"doc\":")
+        _write_json_str(buf, p.doc)
+        write(buf, ",\"code\":")
+        _write_json_str(buf, p.code)
+        write(buf, ",\"time_ms\":")
+        write(buf, string(p.last_run_time_ms))
+        write(buf, ",\"alloc_bytes\":")
+        write(buf, string(p.last_run_alloc_bytes))
+        write(buf, ",\"status\":")
+        _write_json_str(buf, string(p.last_run_status))
+        write(buf, ",\"last_run\":")
+        _write_json_str(buf, p.last_run_at)
+        write(buf, '}')
+        i < length(proc_list) && write(buf, ',')
+    end
+
+    write(buf, "],\"history\":[")
+    recent_cmds = get_recent_commands(limit = 60)
+    for (i, cmd) in enumerate(recent_cmds)
+        _write_json_str(buf, cmd)
+        i < length(recent_cmds) && write(buf, ',')
     end
     write(buf, "]}")
     return String(take!(buf))
@@ -686,42 +1179,6 @@ function _collect_state()
     return _collect_state_dod!(_shared_workspace_table[])
 end
 
-const HIST_START_POS = Ref{Int}(0)
-
-function get_session_commands()
-    hist_path = joinpath(homedir(), ".julia", "logs", "repl_history.jl")
-    !isfile(hist_path) && return String[]
-
-    content = open(hist_path, "r") do f
-        pos = min(HIST_START_POS[], filesize(hist_path))
-        seek(f, pos)
-        read(f, String)
-    end
-
-    commands = String[]
-    current_block = String[]
-
-    for line in split(content, '\n')
-        if startswith(line, "# time:")
-            if !isempty(current_block)
-                cmd = join(current_block, "\n")
-                push!(commands, cmd)
-                empty!(current_block)
-            end
-        elseif !startswith(line, "#")
-            # Strip leading tab which Julia REPL adds to history lines
-            clean_line = startswith(line, '\t') ? line[2:end] : line
-            push!(current_block, clean_line)
-        end
-    end
-    if !isempty(current_block)
-        cmd = join(current_block, "\n")
-        push!(commands, cmd)
-    end
-
-    return filter(c -> !isempty(strip(c)), commands)
-end
-
 function save_clean_session()
     cmds = get_session_commands()
     if isempty(cmds)
@@ -998,6 +1455,7 @@ function publish_state()
 end
 
 function start(; split::Bool = true)
+    _load_procedures!()
     if _running[]
         @info "jEMach Watcher already running"
     else

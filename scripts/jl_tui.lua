@@ -414,7 +414,35 @@ local collapsed = {}
 --   { kind="module", name, row_idx }
 --   { kind="item",   module_name, name, item_type, item_kind, value, row_idx }
 --   { kind="gap" }
-local view_mode = "workspace" -- "workspace" or "packages"
+local active_tab = 1 -- 1: Workspace, 2: History, 3: Procedures, 4: Packages
+local TAB_NAMES = { "Workspace", "History", "Procedures", "Packages" }
+local tab_cursors = { 1, 1, 1, 1 }
+local history_selected = {}
+local proc_view_code = false
+
+-- Modal dialog state
+local modal_active = false
+local modal_title = ""
+local modal_input = ""
+local modal_callback = nil
+
+-- Toast notifications
+local toast_msg = nil
+local toast_expires = 0
+
+local function set_toast(msg, duration)
+	toast_msg = msg
+	toast_expires = os.time() + (duration or 3)
+	dirty = true
+end
+
+local function split_lines(s)
+	local lines = {}
+	for line in (s .. "\n"):gmatch("(.-)\r?\n") do
+		table.insert(lines, line)
+	end
+	return lines
+end
 
 local function prompt_input(prompt_str)
 	raw_mode_off()
@@ -427,10 +455,6 @@ local function prompt_input(prompt_str)
 	return val
 end
 
--- Flat list of "display rows" rebuilt each render pass
---   { kind="module", name, row_idx }
---   { kind="item",   module_name, name, item_type, item_kind, value, row_idx }
---   { kind="gap" }
 local display_rows = {}
 local cursor = 1
 local col_cursor = 1 -- 1: Name, 2: Type, 3: Value
@@ -485,7 +509,7 @@ end
 local function build_display_rows()
 	display_rows = {}
 
-	if view_mode == "packages" then
+	if active_tab == 4 then
 		if not state or not state.packages then
 			display_rows[1] = {
 				kind = "msg",
@@ -508,10 +532,57 @@ local function build_display_rows()
 		return
 	end
 
+	if active_tab == 2 then
+		local hist = state and state.history or {}
+		if #hist == 0 then
+			display_rows[1] = {
+				kind = "msg",
+				text = "No REPL commands captured yet in this session.",
+			}
+			return
+		end
+		for i, cmd in ipairs(hist) do
+			table.insert(display_rows, {
+				kind = "history",
+				idx = i,
+				cmd = cmd,
+				selected = history_selected[i] or false,
+			})
+		end
+		return
+	end
+
+	if active_tab == 3 then
+		local procs = state and state.procedures or {}
+		if #procs == 0 then
+			display_rows[1] = { kind = "msg", text = "No procedures defined yet." }
+			display_rows[2] = { kind = "msg", text = "  → Press '2' for History, select commands with Space, and press 'p'" }
+			display_rows[3] = { kind = "msg", text = "  → In REPL: run jEMach.make_procedure(:name, last=3)" }
+			return
+		end
+		for i, p in ipairs(procs) do
+			table.insert(display_rows, {
+				kind = "procedure",
+				idx = i,
+				name = p.name,
+				signature = p.signature or (p.name .. "()"),
+				file = p.file or "",
+				doc = p.doc or "",
+				code = p.code or "",
+				time_ms = p.time_ms or 0.0,
+				alloc_bytes = p.alloc_bytes or 0,
+				status = p.status or "never",
+				last_run = p.last_run or "-",
+			})
+		end
+		return
+	end
+
+	-- active_tab == 1 (Workspace)
 	if not state or (not state.modules and not state.columns) then
 		display_rows[1] = {
 			kind = "msg",
-			text = 'Waiting for Julia watcher…  (include("scripts/jl_watcher.jl"))',
+			text = "Waiting for Julia watcher… (using jEMach)",
 		}
 		return
 	end
@@ -661,6 +732,19 @@ local function clamp_cursor()
 	if cursor > #display_rows then
 		cursor = #display_rows
 	end
+	if cursor < 1 then
+		cursor = 1
+	end
+	tab_cursors[active_tab] = cursor
+end
+
+local function switch_tab(new_tab)
+	tab_cursors[active_tab] = cursor
+	active_tab = new_tab
+	build_display_rows()
+	cursor = tab_cursors[active_tab] or 1
+	clamp_cursor()
+	dirty = true
 end
 
 -- ---------------------------------------------------------------------------
@@ -691,99 +775,214 @@ local KIND_COLOR = {
 }
 
 local function render(term_rows, term_cols)
-	io.write(HIDE_CUR .. CLEAR)
+	local out_buf = {}
+	table.insert(out_buf, HIDE_CUR .. CLEAR)
 
-	-- Title bar
-	local title = " jEMach " .. (view_mode == "packages" and "Packages" or "Workspace") .. " Panel C-a +l/+h to enter/quit  [" .. repl_pane .. "]"
-	if last_state_ts > 0 then
-		title = title .. "  ✓ " .. os.date("%H:%M:%S", last_state_ts)
+	-- Title / Tab bar
+	table.insert(out_buf, move(1, 1))
+	local tab_parts = {}
+	for i = 1, 4 do
+		local name = TAB_NAMES[i]
+		local badge = ""
+		if i == 2 and state and state.history and #state.history > 0 then
+			badge = " (" .. #state.history .. ")"
+		elseif i == 3 and state and state.procedures and #state.procedures > 0 then
+			badge = " (" .. #state.procedures .. ")"
+		elseif i == 4 and state and state.packages and #state.packages > 0 then
+			badge = " (" .. #state.packages .. ")"
+		end
+		local t_str = " [" .. i .. "] " .. name .. badge .. " "
+		if i == active_tab then
+			table.insert(tab_parts, REV .. BOLD .. FG_GREEN .. t_str .. RESET)
+		else
+			table.insert(tab_parts, DIM .. t_str .. RESET)
+		end
 	end
-	io.write(move(1, 1))
-	io.write(BOLD .. FG_GREEN .. pad_right(title, term_cols) .. RESET)
+	local left_title = table.concat(tab_parts, " ")
 
-	io.write(move(2, 1))
-	io.write(DIM .. string.rep("─", term_cols) .. RESET)
+	local right_info
+	if toast_msg and os.time() <= toast_expires then
+		right_info = REV .. BOLD .. FG_GREEN .. " " .. toast_msg .. " " .. RESET
+	else
+		local sock_icon = (socket_fd >= 0) and (FG_GREEN .. "●" .. RESET) or (DIM .. "○" .. RESET)
+		local ts_str = (last_state_ts > 0) and os.date("%H:%M:%S", last_state_ts) or "--:--:--"
+		right_info = DIM .. "[" .. repl_pane .. "] " .. sock_icon .. " " .. ts_str .. RESET
+	end
 
-	local content_rows = term_rows - 4 -- top 2 lines + bottom 2 lines reserved
+	table.insert(out_buf, left_title .. "  " .. right_info)
+
+	-- Separator
+	table.insert(out_buf, move(2, 1))
+	table.insert(out_buf, DIM .. string.rep("─", term_cols) .. RESET)
+
+	local content_rows = term_rows - 4
 	local total = #display_rows
 
-	local win_start = 1
-	if cursor > content_rows then
-		win_start = cursor - content_rows + 1
-	end
+	if active_tab == 3 and total > 0 and display_rows[1].kind == "procedure" then
+		-- Split view for procedures: top part list, bottom part code preview
+		local list_max_h = math.min(total, math.max(3, math.floor(content_rows * 0.45)))
+		local preview_h = content_rows - list_max_h - 1
 
-	local row_idx = 3
-	for i = win_start, math.min(win_start + content_rows - 1, total) do
-		local dr = display_rows[i]
-		local sel = (i == cursor)
-
-		io.write(move(row_idx, 1))
-
-		if dr.kind == "module" then
-			local color = FG_GREEN
-			local line = string.format("  %s %-20s", dr.icon, dr.name)
-			if sel then
-				io.write(REV .. BOLD .. pad_right(line, term_cols) .. RESET)
-			else
-				io.write(color .. BOLD .. pad_right(line, term_cols) .. RESET)
-			end
-		elseif dr.kind == "item" then
-			local kc = KIND_COLOR[dr.item_kind] or FG_WHITE
-			local indent = string.rep("  ", dr.depth or 0)
-			local item_icon = dr.icon ~= "" and (dr.icon .. " ") or "  "
-			local name_text = "    " .. indent .. item_icon .. dr.name
-			local name_col = pad_right(name_text, 26)
-			local type_col = pad_right(dr.item_type, 18)
-			local val_col = dr.value
-			-- fit value inside remaining space
-			local fixed_w = 26 + 18 + 4
-			local val_max = math.max(0, term_cols - fixed_w - 1)
-			if #val_col > val_max then
-				val_col = val_col:sub(1, val_max - 1) .. "…"
-			end
-			val_col = pad_right(val_col, term_cols - 26 - 18 - 4)
-
-			if sel then
-				local out_str
-				if col_cursor == 1 then
-					out_str = REV .. name_col .. RESET .. kc .. "  " .. type_col .. "  " .. val_col
-				elseif col_cursor == 2 then
-					out_str = name_col .. "  " .. REV .. type_col .. RESET .. kc .. "  " .. val_col
-				else
-					out_str = name_col .. "  " .. type_col .. "  " .. REV .. val_col .. RESET
-				end
-				io.write(kc .. out_str .. RESET)
-			else
-				io.write(kc .. name_col .. "  " .. type_col .. "  " .. val_col .. RESET)
-			end
-		elseif dr.kind == "package" then
-			local name_col = pad_right("  📦 " .. dr.name, 35)
-			local ver_col = pad_right("v" .. dr.version, 15)
-			if sel then
-				io.write(REV .. FG_CYAN .. name_col .. "  " .. FG_GREEN .. ver_col .. RESET)
-			else
-				io.write(FG_CYAN .. name_col .. "  " .. FG_YELLOW .. ver_col .. RESET)
-			end
-		elseif dr.kind == "msg" then
-			io.write(DIM .. pad_right("  " .. (dr.text or ""), term_cols) .. RESET)
+		local win_start = 1
+		if cursor > list_max_h then
+			win_start = cursor - list_max_h + 1
 		end
 
-		row_idx = row_idx + 1
+		local row_idx = 3
+		for i = win_start, math.min(win_start + list_max_h - 1, total) do
+			local dr = display_rows[i]
+			local sel = (i == cursor)
+			table.insert(out_buf, move(row_idx, 1))
+
+			local icon = (dr.status == "ok") and (FG_GREEN .. "✓ " .. RESET) or (dr.status == "error") and (FG_RED .. "✗ " .. RESET) or (DIM .. "○ " .. RESET)
+			local sig_col = pad_right(dr.signature, 36)
+			local metrics = (dr.status ~= "never") and string.format("%6.2fms %6dB  %s", dr.time_ms, dr.alloc_bytes, dr.last_run) or "never run"
+			metrics = pad_right(metrics, 26)
+			local file_col = pad_right(dr.file, math.max(0, term_cols - 36 - 26 - 6))
+
+			if sel then
+				table.insert(out_buf, icon .. REV .. FG_CYAN .. sig_col .. RESET .. " " .. FG_YELLOW .. metrics .. RESET .. " " .. DIM .. file_col .. RESET)
+			else
+				table.insert(out_buf, icon .. FG_CYAN .. sig_col .. RESET .. " " .. FG_YELLOW .. metrics .. RESET .. " " .. DIM .. file_col .. RESET)
+			end
+			row_idx = row_idx + 1
+		end
+
+		-- Preview separator
+		local split_row = 3 + list_max_h
+		table.insert(out_buf, move(split_row, 1))
+		local sel_proc = display_rows[cursor]
+		local preview_title = sel_proc and (" Source: " .. sel_proc.file .. " ") or " Source Preview "
+		table.insert(out_buf, DIM .. "──" .. FG_CYAN .. preview_title .. RESET .. DIM .. string.rep("─", math.max(0, term_cols - #preview_title - 2)) .. RESET)
+
+		-- Preview body
+		local preview_row = split_row + 1
+		if sel_proc and sel_proc.code and sel_proc.code ~= "" then
+			local code_lines = split_lines(sel_proc.code)
+			for li = 1, math.min(#code_lines, preview_h) do
+				table.insert(out_buf, move(preview_row, 1))
+				table.insert(out_buf, FG_WHITE .. pad_right("  " .. code_lines[li], term_cols) .. RESET)
+				preview_row = preview_row + 1
+			end
+		end
+	else
+		-- Full height list for Workspace, History, Packages
+		local win_start = 1
+		if cursor > content_rows then
+			win_start = cursor - content_rows + 1
+		end
+
+		local row_idx = 3
+		for i = win_start, math.min(win_start + content_rows - 1, total) do
+			local dr = display_rows[i]
+			local sel = (i == cursor)
+			table.insert(out_buf, move(row_idx, 1))
+
+			if dr.kind == "module" then
+				local color = FG_GREEN
+				local line = string.format("  %s %-20s", dr.icon, dr.name)
+				if sel then
+					table.insert(out_buf, REV .. BOLD .. pad_right(line, term_cols) .. RESET)
+				else
+					table.insert(out_buf, color .. BOLD .. pad_right(line, term_cols) .. RESET)
+				end
+			elseif dr.kind == "item" then
+				local kc = KIND_COLOR[dr.item_kind] or FG_WHITE
+				local indent = string.rep("  ", dr.depth or 0)
+				local item_icon = dr.icon ~= "" and (dr.icon .. " ") or "  "
+				local name_text = "    " .. indent .. item_icon .. dr.name
+				local name_col = pad_right(name_text, 26)
+				local type_col = pad_right(dr.item_type, 18)
+				local val_col = dr.value
+				local fixed_w = 26 + 18 + 4
+				local val_max = math.max(0, term_cols - fixed_w - 1)
+				if #val_col > val_max then
+					val_col = val_col:sub(1, val_max - 1) .. "…"
+				end
+				val_col = pad_right(val_col, term_cols - 26 - 18 - 4)
+
+				if sel then
+					local out_str
+					if col_cursor == 1 then
+						out_str = REV .. name_col .. RESET .. kc .. "  " .. type_col .. "  " .. val_col
+					elseif col_cursor == 2 then
+						out_str = name_col .. "  " .. REV .. type_col .. RESET .. kc .. "  " .. val_col
+					else
+						out_str = name_col .. "  " .. type_col .. "  " .. REV .. val_col .. RESET
+					end
+					table.insert(out_buf, kc .. out_str .. RESET)
+				else
+					table.insert(out_buf, kc .. name_col .. "  " .. type_col .. "  " .. val_col .. RESET)
+				end
+			elseif dr.kind == "history" then
+				local is_sel = history_selected[dr.idx]
+				local check = is_sel and (FG_GREEN .. BOLD .. "[x] " .. RESET) or (DIM .. "[ ] " .. RESET)
+				local num = FG_YELLOW .. string.format("%3d: ", dr.idx) .. RESET
+				local cmd_text = dr.cmd:gsub("\n", " ⏎ ")
+				local max_w = math.max(10, term_cols - 12)
+				if #cmd_text > max_w then
+					cmd_text = cmd_text:sub(1, max_w - 1) .. "…"
+				end
+				local line_text = pad_right(cmd_text, max_w)
+				if sel then
+					table.insert(out_buf, check .. num .. REV .. line_text .. RESET)
+				else
+					table.insert(out_buf, check .. num .. line_text)
+				end
+			elseif dr.kind == "package" then
+				local name_col = pad_right("  📦 " .. dr.name, 35)
+				local ver_col = pad_right("v" .. dr.version, 15)
+				if sel then
+					table.insert(out_buf, REV .. FG_CYAN .. name_col .. "  " .. FG_GREEN .. ver_col .. RESET)
+				else
+					table.insert(out_buf, FG_CYAN .. name_col .. "  " .. FG_YELLOW .. ver_col .. RESET)
+				end
+			elseif dr.kind == "msg" then
+				table.insert(out_buf, DIM .. pad_right("  " .. (dr.text or ""), term_cols) .. RESET)
+			end
+
+			row_idx = row_idx + 1
+		end
 	end
 
 	-- Bottom separator + help line
-	io.write(move(term_rows - 1, 1))
-	io.write(DIM .. string.rep("─", term_cols) .. RESET)
+	table.insert(out_buf, move(term_rows - 1, 1))
+	table.insert(out_buf, DIM .. string.rep("─", term_cols) .. RESET)
 
-	io.write(move(term_rows, 1))
+	table.insert(out_buf, move(term_rows, 1))
 	local help
-	if view_mode == "packages" then
-		help = "  j/k:move  a:add  d:remove  u:update  P:workspace  q:quit"
-	else
-		help = "  j/k:move  h/l:col/fold  ↵:eval  TAB:insert  i:inspect  s:save  P:packages  q:quit"
+	if active_tab == 1 then
+		help = " 1..4:tabs  j/k:move  h/l:col/fold  ↵:eval  TAB:next tab  i:inspect  s:save  q:quit"
+	elseif active_tab == 2 then
+		help = " 1..4:tabs  j/k:move  Space:select  a:all  p:Make Procedure  ↵:send to REPL  q:quit"
+	elseif active_tab == 3 then
+		help = " 1..4:tabs  j/k:move  ↵:Run  e:Edit args  d:delete  r:reload  q:quit"
+	elseif active_tab == 4 then
+		help = " 1..4:tabs  j/k:move  a:add  d:remove  u:update  q:quit"
 	end
-	io.write(DIM .. pad_right(help, term_cols) .. RESET)
+	table.insert(out_buf, DIM .. pad_right(help, term_cols) .. RESET)
 
+	-- Modal popup overlay if active
+	if modal_active then
+		local box_w = math.min(54, term_cols - 4)
+		local box_h = 5
+		local top = math.floor((term_rows - box_h) / 2)
+		local left = math.floor((term_cols - box_w) / 2)
+
+		local title = " " .. modal_title .. " "
+		local fill_w = math.max(0, box_w - 4 - #title)
+		local top_border = "┌─" .. title .. string.rep("─", fill_w) .. "┐"
+		local bot_border = "└" .. string.rep("─", box_w - 2) .. "┘"
+		local prompt_line = "  Name: " .. modal_input .. REV .. " " .. RESET
+		local hint_line = "  [Enter] Confirm   [Esc] Cancel"
+
+		table.insert(out_buf, move(top, left) .. BOLD .. FG_CYAN .. top_border .. RESET)
+		table.insert(out_buf, move(top + 1, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. pad_right(prompt_line, box_w - 2) .. BOLD .. FG_CYAN .. "│" .. RESET)
+		table.insert(out_buf, move(top + 2, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. DIM .. pad_right(hint_line, box_w - 2) .. RESET .. BOLD .. FG_CYAN .. "│" .. RESET)
+		table.insert(out_buf, move(top + 3, left) .. BOLD .. FG_CYAN .. bot_border .. RESET)
+	end
+
+	io.write(table.concat(out_buf))
 	io.flush()
 end
 
@@ -795,143 +994,175 @@ local function handle_key(key, term_rows, term_cols)
 		return
 	end
 
-	-- Quit
-	if key == "q" or key == "\3" then -- q or Ctrl-C
+	-- Global Quit
+	if key == "\3" then -- Ctrl-C
 		return "quit"
 	end
 
-	-- Movement
-	if key == "j" or key == "\27[B" then -- j or Down arrow
+	-- Modal input interception
+	if modal_active then
+		if key == "\27" then -- ESC
+			modal_active = false
+			dirty = true
+			return
+		elseif key == "\r" or key == "\n" then -- Enter
+			local cb = modal_callback
+			local val = modal_input
+			modal_active = false
+			dirty = true
+			if cb then
+				cb(val)
+			end
+			return
+		elseif key == "\127" or key == "\8" then -- Backspace
+			if #modal_input > 0 then
+				modal_input = modal_input:sub(1, #modal_input - 1)
+				dirty = true
+			end
+			return
+		elseif #key == 1 and key:byte(1) >= 32 and key:byte(1) <= 126 then
+			modal_input = modal_input .. key
+			dirty = true
+			return
+		end
+		return
+	end
+
+	-- Normal mode quit
+	if key == "q" then
+		return "quit"
+	end
+
+	-- Direct tab jump keys
+	if key == "1" then switch_tab(1); return end
+	if key == "2" then switch_tab(2); return end
+	if key == "3" then switch_tab(3); return end
+	if key == "4" then switch_tab(4); return end
+
+	-- Tab cycle keys
+	if key == "\t" or key == "]" then
+		switch_tab((active_tab % 4) + 1)
+		return
+	elseif key == "[" then
+		switch_tab((active_tab == 1) and 4 or (active_tab - 1))
+		return
+	end
+
+	-- Movement: j / k / Down / Up
+	if key == "j" or key == "\27[B" then
 		cursor = cursor + 1
 		clamp_cursor()
-	elseif key == "k" or key == "\27[A" then -- k or Up arrow
+		return
+	elseif key == "k" or key == "\27[A" then
 		cursor = cursor - 1
 		clamp_cursor()
+		return
+	end
 
-	-- Collapse (h)
-	elseif key == "h" or key == "\27[D" then
-		local dr = display_rows[cursor]
-		if dr then
-			if dr.kind == "module" then
-				collapsed[dr.name] = true
-			elseif dr.kind == "item" then
-				if col_cursor > 1 then
-					col_cursor = col_cursor - 1
-				elseif dr.has_children and not collapsed[dr.path] then
-					collapsed[dr.path] = true
-				else
-					local parent_path = dr.path:match("(.*)/[^/]+$")
-					if parent_path and parent_path ~= dr.module_name then
-						collapsed[parent_path] = true
-						build_display_rows()
-						for i, r in ipairs(display_rows) do
-							if r.kind == "item" and r.path == parent_path then
-								cursor = i
-								break
-							end
-						end
+	-- -----------------------------------------------------------------------
+	-- Tab 1: Workspace
+	-- -----------------------------------------------------------------------
+	if active_tab == 1 then
+		if key == "h" or key == "\27[D" then
+			local dr = display_rows[cursor]
+			if dr then
+				if dr.kind == "module" then
+					collapsed[dr.name] = true
+				elseif dr.kind == "item" then
+					if col_cursor > 1 then
+						col_cursor = col_cursor - 1
+					elseif dr.has_children and not collapsed[dr.path] then
+						collapsed[dr.path] = true
 					else
-						collapsed[dr.module_name] = true
-						build_display_rows()
-						for i, r in ipairs(display_rows) do
-							if r.kind == "module" and r.name == dr.module_name then
-								cursor = i
-								break
+						local parent_path = dr.path:match("(.*)/[^/]+$")
+						if parent_path and parent_path ~= dr.module_name then
+							collapsed[parent_path] = true
+							build_display_rows()
+							for i, r in ipairs(display_rows) do
+								if r.kind == "item" and r.path == parent_path then
+									cursor = i
+									break
+								end
+							end
+						else
+							collapsed[dr.module_name] = true
+							build_display_rows()
+							for i, r in ipairs(display_rows) do
+								if r.kind == "module" and r.name == dr.module_name then
+									cursor = i
+									break
+								end
 							end
 						end
 					end
 				end
+				build_display_rows()
+				clamp_cursor()
 			end
-			build_display_rows()
-			clamp_cursor()
-		end
-
-	-- Expand / print (l or Enter)
-	elseif key == "l" or key == "\27[C" then
-		local dr = display_rows[cursor]
-		if dr then
-			if dr.kind == "module" then
-				if dr.collapsed then
+		elseif key == "l" or key == "\27[C" then
+			local dr = display_rows[cursor]
+			if dr then
+				if dr.kind == "module" then
+					if dr.collapsed then
+						collapsed[dr.name] = nil
+						build_display_rows()
+						clamp_cursor()
+					end
+				elseif dr.kind == "item" then
+					if dr.has_children and collapsed[dr.path] then
+						collapsed[dr.path] = nil
+						build_display_rows()
+						clamp_cursor()
+					elseif col_cursor < 3 then
+						col_cursor = col_cursor + 1
+					end
+				end
+			end
+		elseif key == "\r" or key == "\n" then
+			local dr = display_rows[cursor]
+			if dr then
+				if dr.kind == "module" and dr.collapsed then
 					collapsed[dr.name] = nil
 					build_display_rows()
 					clamp_cursor()
-				end
-			elseif dr.kind == "item" then
-				if dr.has_children and collapsed[dr.path] then
-					collapsed[dr.path] = nil
-					build_display_rows()
-					clamp_cursor()
-				elseif col_cursor < 3 then
-					col_cursor = col_cursor + 1
+				elseif dr.kind == "item" then
+					if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
+						local code
+						if col_cursor == 1 then
+							code = "println(" .. dr.expr .. ")"
+						elseif col_cursor == 2 then
+							code = "typeof(" .. dr.expr .. ")"
+						else
+							code = "dump(" .. dr.expr .. ")"
+						end
+						tmux_send(code)
+					end
 				end
 			end
-		end
-
-	-- Enter key
-	elseif key == "\r" or key == "\n" then
-		local dr = display_rows[cursor]
-		if dr then
-			if dr.kind == "module" and dr.collapsed then
-				collapsed[dr.name] = nil
-				build_display_rows()
-				clamp_cursor()
-			elseif dr.kind == "item" then
+		elseif key == "i" then
+			local dr = display_rows[cursor]
+			if dr and dr.kind == "item" then
 				if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
-					local code
-					if col_cursor == 1 then
-						code = "println(" .. dr.expr .. ")"
-					elseif col_cursor == 2 then
-						code = "typeof(" .. dr.expr .. ")"
-					else
-						code = "dump(" .. dr.expr .. ")"
-					end
+					local code = string.format("jEMach.inspect_var(%s, %q)", dr.module_name, dr.expr)
 					tmux_send(code)
 				end
 			end
-		end
-
-	-- Inspect (i)
-	elseif key == "i" then
-		local dr = display_rows[cursor]
-		if dr and dr.kind == "item" then
-			if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
-				local code = string.format("jEMach.inspect_var(%s, %q)", dr.module_name, dr.expr)
-				tmux_send(code)
-			end
-		end
-
-	-- Clear REPL (c)
-	elseif key == "c" then
-		os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
-
-	-- Save clean session (s)
-	elseif key == "s" then
-		tmux_send("jEMach.save_clean_session()")
-
-	-- Insert/Edit in REPL (e or Tab)
-	elseif key == "e" or key == "\t" then
-		local dr = display_rows[cursor]
-		if dr and dr.kind == "item" then
-			if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
-				if dr.item_kind == "function" then
-					os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.expr))
-				else
-					os.execute(string.format("tmux send-keys -t '%s' '%s '", repl_pane, dr.expr))
-				end
-			end
-		end
-
-	-- Hide/Remove (d)
-	elseif key == "d" then
-		if view_mode == "packages" then
+		elseif key == "c" then
+			os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
+		elseif key == "s" then
+			tmux_send("jEMach.save_clean_session()")
+		elseif key == "e" then
 			local dr = display_rows[cursor]
-			if dr and dr.kind == "package" then
-				local confirm = prompt_input("Remove package '" .. dr.name .. "'? (y/n): ")
-				if confirm == "y" or confirm == "yes" or confirm == "Y" then
-					tmux_send(string.format("import Pkg; Pkg.rm(%q)", dr.name))
+			if dr and dr.kind == "item" then
+				if dr.expr:match("^[%a_][%w_!%.%[%]%s%\"%:%']*$") then
+					if dr.item_kind == "function" then
+						os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.expr))
+					else
+						os.execute(string.format("tmux send-keys -t '%s' '%s '", repl_pane, dr.expr))
+					end
 				end
 			end
-		else
+		elseif key == "d" then
 			local dr = display_rows[cursor]
 			if dr then
 				if dr.kind == "module" then
@@ -945,40 +1176,119 @@ local function handle_key(key, term_rows, term_cols)
 				end
 				clamp_cursor()
 			end
+		elseif key == "D" then
+			hidden = {}
+			build_display_rows()
+			clamp_cursor()
+		elseif key == "r" then
+			last_mtime = 0
 		end
 
-	-- Add package (a)
-	elseif key == "a" and view_mode == "packages" then
-		local pkg_name = prompt_input("Enter package name to add: ")
-		if pkg_name and pkg_name ~= "" then
-			tmux_send(string.format("import Pkg; Pkg.add(%q)", pkg_name))
+	-- -----------------------------------------------------------------------
+	-- Tab 2: History
+	-- -----------------------------------------------------------------------
+	elseif active_tab == 2 then
+		if key == " " then
+			local dr = display_rows[cursor]
+			if dr and dr.kind == "history" then
+				history_selected[dr.idx] = not history_selected[dr.idx]
+				build_display_rows()
+			end
+		elseif key == "a" then
+			local any = false
+			local hist = state and state.history or {}
+			for i = 1, #hist do
+				if history_selected[i] then any = true; break end
+			end
+			for i = 1, #hist do
+				history_selected[i] = not any
+			end
+			build_display_rows()
+		elseif key == "\r" or key == "\n" then
+			local dr = display_rows[cursor]
+			if dr and dr.kind == "history" then
+				tmux_send(dr.cmd)
+				set_toast("Sent command to REPL")
+			end
+		elseif key == "p" then
+			local default_name = "proc_" .. tostring(#(state and state.procedures or {}) + 1)
+			modal_active = true
+			modal_title = "Create Procedure"
+			modal_input = default_name
+			modal_callback = function(name)
+				name = name:gsub("%s+", "")
+				if name == "" then return end
+				local sel_indices = {}
+				local hist = state and state.history or {}
+				for i = 1, #hist do
+					if history_selected[i] then
+						table.insert(sel_indices, tostring(i))
+					end
+				end
+				if #sel_indices == 0 and display_rows[cursor] then
+					table.insert(sel_indices, tostring(display_rows[cursor].idx))
+				end
+				local cmd = string.format("jEMach.make_procedure(:%s; indices=[%s])", name, table.concat(sel_indices, ","))
+				tmux_send(cmd)
+				set_toast("✓ Generated procedure '" .. name .. "'!")
+				switch_tab(3)
+			end
+		elseif key == "c" then
+			os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
 		end
 
-	-- Update package (u)
-	elseif key == "u" and view_mode == "packages" then
+	-- -----------------------------------------------------------------------
+	-- Tab 3: Procedures
+	-- -----------------------------------------------------------------------
+	elseif active_tab == 3 then
 		local dr = display_rows[cursor]
-		if dr and dr.kind == "package" then
-			tmux_send(string.format("import Pkg; Pkg.update(%q)", dr.name))
-		else
-			tmux_send("import Pkg; Pkg.update()")
+		if key == "\r" or key == "\n" then
+			if dr and dr.kind == "procedure" then
+				tmux_send(string.format("jEMach.run_procedure(:%s)", dr.name))
+				set_toast("▶ Running procedure " .. dr.name .. "...")
+			end
+		elseif key == "e" then
+			if dr and dr.kind == "procedure" then
+				os.execute(string.format("tmux send-keys -t '%s' '%s()' Left", repl_pane, dr.name))
+				set_toast("Pasted " .. dr.name .. "() into REPL")
+			end
+		elseif key == "d" then
+			if dr and dr.kind == "procedure" then
+				local confirm = prompt_input("Delete procedure '" .. dr.name .. "'? (y/n): ")
+				if confirm == "y" or confirm == "yes" or confirm == "Y" then
+					tmux_send(string.format("rm(%q); jEMach._load_procedures!(); jEMach.publish_state()", dr.file))
+					set_toast("Deleted procedure " .. dr.name)
+				end
+			end
+		elseif key == "r" then
+			tmux_send("jEMach._load_procedures!(); jEMach.publish_state()")
+			set_toast("Reloaded procedures")
 		end
 
-	-- Toggle view mode (P)
-	elseif key == "P" then
-		view_mode = (view_mode == "workspace") and "packages" or "workspace"
-		cursor = 1
-		build_display_rows()
-		clamp_cursor()
-
-	-- Restore all hidden (D)
-	elseif key == "D" then
-		hidden = {}
-		build_display_rows()
-		clamp_cursor()
-
-	-- Force refresh (r)
-	elseif key == "r" then
-		last_mtime = 0 -- force reload on next poll
+	-- -----------------------------------------------------------------------
+	-- Tab 4: Packages
+	-- -----------------------------------------------------------------------
+	elseif active_tab == 4 then
+		local dr = display_rows[cursor]
+		if key == "a" then
+			local pkg_name = prompt_input("Enter package name to add: ")
+			if pkg_name and pkg_name ~= "" then
+				tmux_send(string.format("import Pkg; Pkg.add(%q)", pkg_name))
+			end
+		elseif key == "d" then
+			if dr and dr.kind == "package" then
+				local confirm = prompt_input("Remove package '" .. dr.name .. "'? (y/n): ")
+				if confirm == "y" or confirm == "yes" or confirm == "Y" then
+					tmux_send(string.format("import Pkg; Pkg.rm(%q)", dr.name))
+				end
+			end
+		elseif key == "u" then
+			if dr and dr.kind == "package" then
+				tmux_send(string.format("import Pkg; Pkg.update(%q)", dr.name))
+			else
+				tmux_send("import Pkg; Pkg.update()")
+			end
+		end
 	end
 end
 

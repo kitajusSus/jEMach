@@ -87,24 +87,77 @@ See [docs/src/startup.md](docs/src/startup.md) for advanced configuration.
 
 ---
 
+## TUI Tabs & Navigation
+
+The TUI provides 4 dedicated panels accessible via `1`, `2`, `3`, `4` or `Tab`:
+
+- **`[1] Workspace`**: Real-time Data-Oriented tree view of variables, matrices, dataframes, structs, and modules.
+- **`[2] History`**: REPL session command log with multi-select checkboxes (`Space`) to package commands into reusable procedures (`p`).
+- **`[3] Procedures`**: Library of saved procedures with live split-view source code preview, run execution benchmarks (`Enter`), and REPL parameter editing (`e`).
+- **`[4] Packages`**: Interactive project package manager (`a` add, `d` remove, `u` update).
+
+---
+
+## Reusable Procedures & REPL History
+
+Turn your experimental REPL commands into parameterized, reproducible procedures with automatic AST variable analysis:
+
+### 1. From the Interactive TUI (`jl-assist`)
+1. Press `2` to switch to **History**.
+2. Press `Space` to toggle `[x]` on the commands you want in your procedure.
+3. Press `p` (**Make Procedure**): an inline modal dialog will prompt for the procedure name.
+4. Hit `Enter`: `jEMach` extracts free variables, sets default values from your session, generates `procedures/<name>.jl`, and automatically loads it!
+5. In **`[3] Procedures`**, hit `Enter` to run with profiling or `e` to edit arguments in the REPL.
+
+### 2. Directly in Julia REPL
+```julia
+using jEMach
+
+# Option A: Extract last N commands into a parameterized procedure
+jEMach.make_procedure(:check_sample, last=4)
+
+# Option B: Record commands interactively
+jEMach.record(:verify_matrix)
+A = rand(10, 10)
+A = A + A'
+e = eigen(A)
+all(e.values .> -1e-5)
+jEMach.record_stop()
+
+# Run procedure with profiling (time & memory metrics tracked in TUI)
+jEMach.run_procedure(:check_sample)
+
+# List all discovered procedures and benchmark status
+jEMach.list_procedures()
+```
+
+---
+
 ## TUI Keybindings
 
-| Key | Action |
-|:---|:---|
-| `j` / `k` (or `↓` / `↑`) | Move cursor down / up |
-| `l` / `↵` (Enter) | Expand node **or** evaluate `println(var)` in REPL |
-| `h` (or `←`) | Collapse node / jump to parent |
-| `i` | Inspect variable details, methods, and creation history |
-| `Tab` / `e` | Insert variable expression directly into REPL command line |
-| `d` | Hide item from view (in workspace mode) / Remove package (in package mode) |
-| `D` | Restore all hidden items |
-| `P` | Toggle between Workspace and Package Manager views |
-| `a` | Add new package (in package view) |
-| `u` | Update package (in package view) |
-| `s` | Save clean reproducible session script |
-| `c` | Clear REPL screen (`Ctrl-L`) |
-| `r` | Force state refresh |
-| `q` / `Ctrl-C` | Quit assistant |
+| Key | Context | Action |
+|:---|:---|:---|
+| `1` / `2` / `3` / `4` | Global | Jump directly to Workspace / History / Procedures / Packages |
+| `Tab` / `]` / `[` | Global | Cycle to next / previous tab |
+| `j` / `k` (or `↓` / `↑`) | Global | Move cursor down / up |
+| `Space` | History | Toggle selection `[x]` / `[ ]` on command |
+| `a` | History | Toggle select all / clear all |
+| `p` | History | **Make Procedure** from selected commands (opens modal prompt) |
+| `↵` (Enter) | History | Send highlighted command to REPL |
+| `↵` (Enter) | Procedures | Run highlighted procedure with benchmark profiling |
+| `e` | Procedures | Paste `<proc_name>()` into REPL line to customize parameters |
+| `d` | Procedures | Delete procedure file from disk (with confirmation) |
+| `r` | Procedures | Reload procedure definitions from disk |
+| `l` / `↵` (Enter) | Workspace | Expand node **or** evaluate `println(var)` in REPL |
+| `h` (or `←`) | Workspace | Collapse node / jump to parent |
+| `i` | Workspace | Inspect variable details, methods, and creation history |
+| `e` | Workspace | Insert variable expression directly into REPL command line |
+| `d` | Workspace | Hide item from view |
+| `D` | Workspace | Restore all hidden items |
+| `s` | Workspace | Save clean reproducible session script |
+| `a` / `d` / `u` | Packages | Add / Remove / Update package |
+| `c` | Global | Clear REPL screen (`Ctrl-L`) |
+| `q` / `Ctrl-C` | Global | Quit assistant |
 
 ---
 
