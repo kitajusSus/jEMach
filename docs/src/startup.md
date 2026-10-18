@@ -45,11 +45,6 @@ if isinteractive()
         try
             using jEMach
         catch
-            # Fallback path if installed via Neovim lazy/packer package store
-            jemach_file = joinpath(homedir(), ".local/share/nvim/site/pack/core/opt/jemach/scripts/jl_watcher.jl")
-            if isfile(jemach_file)
-                include(jemach_file)
-            end
         end
     end
 end

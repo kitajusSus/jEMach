@@ -1,17 +1,17 @@
 # Engineer's Notebook: jEMach.jl
 
-Field notes and internal architecture log for `jEMach.jl` - Julia runtime introspection watcher for Neovim and terminal UI (`jl-assist`).
+Field notes and internal architecture log for `jEMach.jl` - Data-Oriented Julia runtime introspection engine and terminal workspace assistant (`jl-assist`).
 
 ## Core Overview
 
 jEMach runs an asynchronous background task inside the active Julia REPL process.
-It extracts active module symbols, types, evaluated values, and project dependencies, serializing them into JSON for consumption by terminal UIs (`jl-assist`) or Neovim buffers (`lua/jemach/workspace.lua`).
+It extracts active module symbols, types, evaluated values, and project dependencies, serializing them into a Data-Oriented Design (DoD) columnar format for consumption by terminal UIs (`jl-assist`) and Zig broker IPC.
 
 #### Components
 
-- **jEMach.jl**: Julia package exporting async background task watcher.
-- **jl-assist / jl_tui.lua**: LuaJIT tmux terminal UI inspector.
-- **lua/jemach/**: Neovim Lua plugin providing keybindings, buffer splits, slime/toggleterm integration, and Tree-sitter selection tools.
+- **jEMach.jl**: Julia package exporting async background task watcher with Data-Oriented Design (DoD) tables.
+- **jl-assist / jl_tui.lua**: LuaJIT tmux terminal UI inspector with interactive keyboard navigation.
+- **zig/**: Native IPC broker with Struct-of-Arrays (SoA) data structures.
 
 ## Documentation Sections
 

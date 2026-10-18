@@ -1016,11 +1016,7 @@ function start(; split::Bool = true)
 
     if split
         # Find the path of the jl-assist TUI script
-        assist_path = joinpath(@__DIR__, "..", "scripts", "jl-assist")
-        if !isfile(assist_path)
-            # Fallback to standard installation path
-            assist_path = joinpath(homedir(), ".local/share/nvim/site/pack/core/opt/jemach/scripts/jl-assist")
-        end
+        assist_path = normpath(joinpath(@__DIR__, "..", "scripts", "jl-assist"))
 
         try
             pane_id = strip(read(`tmux split-window -P -F "#{pane_id}" -h -l 80 $assist_path`, String))

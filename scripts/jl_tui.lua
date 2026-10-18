@@ -1,7 +1,7 @@
 #!/usr/bin/env luajit
 -- jl_tui.lua — Standalone Julia Workspace TUI
 --
--- Requires: luajit (ships with Neovim on Arch Linux)
+-- Requires: luajit
 -- Usage:    luajit scripts/jl_tui.lua [JULIA_PANE_ID]
 --
 -- JULIA_PANE_ID is the tmux pane target for the Julia REPL

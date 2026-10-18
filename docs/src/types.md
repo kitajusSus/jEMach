@@ -36,4 +36,4 @@ Technical breakdown of type introspection mechanics implemented in `jEMach._get_
 
 ## Interactivity & REPL Print Action
 
-Each expanded node provides a clickable/selectable `expr` string. Pressing `l` or Enter in `jl-assist` or Neovim sends `println(expr)` directly to the connected Julia REPL pane for instant value evaluation.
+Each expanded node provides a selectable `expr` string. Pressing `l` or Enter in `jl-assist` sends `println(expr)` directly to the connected Julia REPL pane for instant value evaluation.

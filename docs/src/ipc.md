@@ -1,6 +1,6 @@
 # IPC & Socket Architecture
 
-Overview of communication mechanics implemented between `jEMach.jl` and UI consumers (`jl-assist` TUI and Neovim `workspace.lua`).
+Overview of communication mechanics implemented between `jEMach.jl` and UI consumers (`jl-assist` TUI and Zig broker).
 
 ## Dual Sync Mechanism
 
@@ -18,7 +18,7 @@ Overview of communication mechanics implemented between `jEMach.jl` and UI consu
                      |                                   |
             +--------+--------+                 +--------+--------+
             |                 |                 |                 |
-     jl-assist TUI      Neovim Plugin     Fallback Reader   Offline Inspector
+     jl-assist TUI       Zig Broker       Fallback Reader   Offline Inspector
 ```
 
 ## UNIX Domain Socket Broadcasting
