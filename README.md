@@ -127,8 +127,10 @@ jEMach.record_stop()
 # Run procedure with profiling (time & memory metrics tracked in TUI)
 jEMach.run_procedure(:check_sample)
 
-# List all discovered procedures and benchmark status
+# List all discovered procedures (with optional search query)
 jEMach.list_procedures()
+jEMach.list_procedures("matrix")
+jEMach.find_procedures("sample")
 ```
 
 ---
@@ -137,6 +139,8 @@ jEMach.list_procedures()
 
 | Key | Context | Action |
 |:---|:---|:---|
+| `/` | Global | **Search & Live Filter** (procedures, workspace variables, history, packages) |
+| `Esc` / `x` | Global | Clear search filter and restore full list |
 | `1` / `2` / `3` / `4` | Global | Jump directly to Workspace / History / Procedures / Packages |
 | `Tab` / `]` / `[` | Global | Cycle to next / previous tab |
 | `j` / `k` (or `↓` / `↑`) | Global | Move cursor down / up |
@@ -146,7 +150,7 @@ jEMach.list_procedures()
 | `↵` (Enter) | History | Send highlighted command to REPL |
 | `↵` (Enter) | Procedures | Run highlighted procedure with benchmark profiling |
 | `e` | Procedures | Paste `<proc_name>()` into REPL line to customize parameters |
-| `d` | Procedures | Delete procedure file from disk (with confirmation) |
+| `d` | Procedures | Delete procedure file from disk (with in-TUI confirmation) |
 | `r` | Procedures | Reload procedure definitions from disk |
 | `l` / `↵` (Enter) | Workspace | Expand node **or** evaluate `println(var)` in REPL |
 | `h` (or `←`) | Workspace | Collapse node / jump to parent |
@@ -155,7 +159,7 @@ jEMach.list_procedures()
 | `d` | Workspace | Hide item from view |
 | `D` | Workspace | Restore all hidden items |
 | `s` | Workspace | Save clean reproducible session script |
-| `a` / `d` / `u` | Packages | Add / Remove / Update package |
+| `a` / `d` / `u` | Packages | Add / Remove / Update package (in-TUI dialogs) |
 | `c` | Global | Clear REPL screen (`Ctrl-L`) |
 | `q` / `Ctrl-C` | Global | Quit assistant |
 

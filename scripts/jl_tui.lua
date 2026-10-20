@@ -274,6 +274,40 @@ local function read_key(timeout_ms)
 	return nil
 end
 
+local input_queue = {}
+
+local function queue_keys(raw)
+	local pos = 1
+	local len = #raw
+	while pos <= len do
+		if raw:sub(pos, pos) == "\27" then
+			local esc_seq = raw:match("^\27%[[%d;]*[a-zA-Z~]", pos)
+			if esc_seq then
+				table.insert(input_queue, esc_seq)
+				pos = pos + #esc_seq
+			else
+				table.insert(input_queue, "\27")
+				pos = pos + 1
+			end
+		else
+			table.insert(input_queue, raw:sub(pos, pos))
+			pos = pos + 1
+		end
+	end
+end
+
+local function get_next_key(timeout_ms)
+	if #input_queue > 0 then
+		return table.remove(input_queue, 1)
+	end
+	local raw = read_key(timeout_ms)
+	if not raw or raw == "" then
+		return nil
+	end
+	queue_keys(raw)
+	return table.remove(input_queue, 1)
+end
+
 -- ---------------------------------------------------------------------------
 -- Terminal control helpers (ANSI/VT100)
 -- ---------------------------------------------------------------------------
@@ -283,13 +317,166 @@ local HIDE_CUR = ESC .. "[?25l"
 local SHOW_CUR = ESC .. "[?25h"
 local BOLD = ESC .. "[1m"
 local DIM = ESC .. "[2m"
+local ITALIC = ESC .. "[3m"
+local UNDERLINE = ESC .. "[4m"
 local RESET = ESC .. "[0m"
 local REV = ESC .. "[7m" -- reverse video (selection highlight)
-local FG_CYAN = ESC .. "[36m"
-local FG_GREEN = ESC .. "[32m"
-local FG_YELLOW = ESC .. "[33m"
-local FG_RED = ESC .. "[31m"
-local FG_WHITE = ESC .. "[37m"
+
+-- Modern 256-color palette
+local FG_CYAN = ESC .. "[38;5;51m"
+local FG_AQUA = ESC .. "[38;5;45m"
+local FG_TEAL = ESC .. "[38;5;37m"
+local FG_GREEN = ESC .. "[38;5;84m"
+local FG_YELLOW = ESC .. "[38;5;221m"
+local FG_ORANGE = ESC .. "[38;5;215m"
+local FG_PURPLE = ESC .. "[38;5;141m"
+local FG_MAGENTA = ESC .. "[38;5;207m"
+local FG_RED = ESC .. "[38;5;203m"
+local FG_WHITE = ESC .. "[38;5;255m"
+local FG_LIGHT_GRAY = ESC .. "[38;5;250m"
+local FG_GRAY = ESC .. "[38;5;244m"
+local FG_DARK_GRAY = ESC .. "[38;5;238m"
+
+local BG_SEL = ESC .. "[48;5;236m"
+local BG_TAB_ACT = ESC .. "[48;5;24m"
+local BG_HEADER = ESC .. "[48;5;235m"
+
+local function strip_ansi(s)
+	return tostring(s or ""):gsub("\27%[[%d;]*[a-zA-Z]", "")
+end
+
+local function visible_len(s)
+	local clean = strip_ansi(s)
+	local _, count = clean:gsub("[%z\1-\127\194-\244][\128-\191]*", "")
+	return count
+end
+
+local function pad_right(s, width)
+	s = tostring(s or "")
+	local vlen = visible_len(s)
+	if vlen >= width then
+		return s
+	end
+	return s .. string.rep(" ", width - vlen)
+end
+
+local function truncate_visible(s, max_w)
+	s = tostring(s or "")
+	local clean = strip_ansi(s)
+	local vlen = visible_len(clean)
+	if vlen <= max_w then
+		return s
+	end
+	local cur_w = 0
+	local res = {}
+	for c in clean:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+		if cur_w >= max_w - 1 then
+			table.insert(res, "…")
+			break
+		end
+		table.insert(res, c)
+		cur_w = cur_w + 1
+	end
+	return table.concat(res)
+end
+
+local JL_KEYWORDS = {
+	["function"] = true, ["end"] = true, ["return"] = true, ["if"] = true, ["else"] = true,
+	["elseif"] = true, ["for"] = true, ["while"] = true, ["in"] = true, ["let"] = true,
+	["begin"] = true, ["try"] = true, ["catch"] = true, ["finally"] = true, ["using"] = true,
+	["import"] = true, ["export"] = true, ["struct"] = true, ["mutable"] = true, ["const"] = true,
+	["global"] = true, ["local"] = true, ["macro"] = true, ["module"] = true, ["baremodule"] = true,
+	["quote"] = true, ["do"] = true
+}
+local JL_TYPES = {
+	["Int"] = true, ["Int64"] = true, ["Int32"] = true, ["Int16"] = true, ["Int8"] = true,
+	["UInt"] = true, ["UInt64"] = true, ["UInt32"] = true, ["UInt16"] = true, ["UInt8"] = true,
+	["Float64"] = true, ["Float32"] = true, ["String"] = true, ["Char"] = true,
+	["Vector"] = true, ["Matrix"] = true, ["Array"] = true, ["DataFrame"] = true,
+	["Bool"] = true, ["Dict"] = true, ["Set"] = true, ["Symbol"] = true, ["Any"] = true,
+	["Nothing"] = true, ["Missing"] = true, ["Tuple"] = true, ["NamedTuple"] = true,
+	["Union"] = true, ["Number"] = true, ["Real"] = true, ["Integer"] = true, ["Ref"] = true
+}
+local JL_LITERALS = {
+	["true"] = true, ["false"] = true, ["nothing"] = true, ["missing"] = true, ["undef"] = true
+}
+
+local function highlight_julia_line(line)
+	local out = {}
+	local pos = 1
+	local len = #line
+
+	while pos <= len do
+		local c = line:sub(pos, pos)
+		if c == "#" then
+			table.insert(out, FG_GRAY .. ITALIC .. line:sub(pos) .. RESET)
+			break
+		elseif c == "\"" or c == "'" then
+			local quote = c
+			local end_pos = pos + 1
+			while end_pos <= len do
+				local ch = line:sub(end_pos, end_pos)
+				if ch == "\\" then
+					end_pos = end_pos + 2
+				elseif ch == quote then
+					end_pos = end_pos + 1
+					break
+				else
+					end_pos = end_pos + 1
+				end
+			end
+			table.insert(out, FG_GREEN .. line:sub(pos, end_pos - 1) .. RESET)
+			pos = end_pos
+		elseif c == ":" and pos < len and line:sub(pos + 1, pos + 1):match("[%a_]") then
+			local sym_end = pos + 1
+			while sym_end <= len and line:sub(sym_end, sym_end):match("[%w_!]") do
+				sym_end = sym_end + 1
+			end
+			table.insert(out, FG_AQUA .. line:sub(pos, sym_end - 1) .. RESET)
+			pos = sym_end
+		elseif c == "@" and pos < len and line:sub(pos + 1, pos + 1):match("[%a_]") then
+			local mac_end = pos + 1
+			while mac_end <= len and line:sub(mac_end, mac_end):match("[%w_!]") do
+				mac_end = mac_end + 1
+			end
+			table.insert(out, FG_PURPLE .. line:sub(pos, mac_end - 1) .. RESET)
+			pos = mac_end
+		elseif c:match("[%a_]") then
+			local word_end = pos + 1
+			while word_end <= len and line:sub(word_end, word_end):match("[%w_!]") do
+				word_end = word_end + 1
+			end
+			local w = line:sub(pos, word_end - 1)
+			if JL_KEYWORDS[w] then
+				table.insert(out, BOLD .. FG_PURPLE .. w .. RESET)
+			elseif JL_TYPES[w] then
+				table.insert(out, BOLD .. FG_CYAN .. w .. RESET)
+			elseif JL_LITERALS[w] then
+				table.insert(out, FG_ORANGE .. w .. RESET)
+			else
+				table.insert(out, FG_WHITE .. w .. RESET)
+			end
+			pos = word_end
+		elseif c:match("%d") then
+			local num_end = pos + 1
+			while num_end <= len and line:sub(num_end, num_end):match("[%d%.eExXa-fA-F_]") do
+				num_end = num_end + 1
+			end
+			table.insert(out, FG_YELLOW .. line:sub(pos, num_end - 1) .. RESET)
+			pos = num_end
+		elseif c:match("[%[%]%{%}%(%),;]") then
+			table.insert(out, FG_LIGHT_GRAY .. c .. RESET)
+			pos = pos + 1
+		elseif c:match("[%+%-*%/%^=<>!&|~]") then
+			table.insert(out, FG_AQUA .. c .. RESET)
+			pos = pos + 1
+		else
+			table.insert(out, c)
+			pos = pos + 1
+		end
+	end
+	return table.concat(out)
+end
 
 local function move(row, col)
 	return ESC .. "[" .. row .. ";" .. col .. "H"
@@ -474,6 +661,10 @@ local tab_cursors = { 1, 1, 1, 1 }
 local history_selected = {}
 local proc_view_code = false
 
+-- Search & Filter state
+local search_mode = false
+local search_query = ""
+
 -- Modal dialog state
 local modal_active = false
 local modal_title = ""
@@ -496,17 +687,6 @@ local function split_lines(s)
 		table.insert(lines, line)
 	end
 	return lines
-end
-
-local function prompt_input(prompt_str)
-	raw_mode_off()
-	io.write(SHOW_CUR)
-	io.write("\n" .. prompt_str)
-	io.flush()
-	local val = io.read("*l")
-	raw_mode_on()
-	io.write(HIDE_CUR)
-	return val
 end
 
 local display_rows = {}
@@ -562,11 +742,14 @@ local function load_state()
 end
 
 -- ---------------------------------------------------------------------------
--- Build the flat display_rows list from current state + collapsed/hidden sets
+-- Build the flat display_rows list with search filter
 -- ---------------------------------------------------------------------------
 local function build_display_rows()
 	display_rows = {}
+	local q = (search_query or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+	local has_filter = (q ~= "")
 
+	-- Tab 4: Packages
 	if active_tab == 4 then
 		if not state or not state.packages then
 			display_rows[1] = {
@@ -577,19 +760,28 @@ local function build_display_rows()
 		end
 
 		for _, pkg in ipairs(state.packages) do
-			table.insert(display_rows, {
-				kind = "package",
-				name = pkg.name,
-				version = pkg.version,
-			})
+			local pname = pkg.name or ""
+			local pver = pkg.version or ""
+			if not has_filter or pname:lower():find(q, 1, true) or pver:lower():find(q, 1, true) then
+				table.insert(display_rows, {
+					kind = "package",
+					name = pname,
+					version = pver,
+				})
+			end
 		end
 
 		if #display_rows == 0 then
-			display_rows[1] = { kind = "msg", text = "No packages in active environment." }
+			if has_filter then
+				display_rows[1] = { kind = "empty_search", text = "No packages matching \"" .. search_query .. "\"." }
+			else
+				display_rows[1] = { kind = "msg", text = "No packages in active environment." }
+			end
 		end
 		return
 	end
 
+	-- Tab 2: History
 	if active_tab == 2 then
 		local hist = state and state.history or {}
 		if #hist == 0 then
@@ -600,43 +792,69 @@ local function build_display_rows()
 			return
 		end
 		for i, cmd in ipairs(hist) do
-			table.insert(display_rows, {
-				kind = "history",
-				idx = i,
-				cmd = cmd,
-				selected = history_selected[i] or false,
-			})
+			if not has_filter or cmd:lower():find(q, 1, true) then
+				table.insert(display_rows, {
+					kind = "history",
+					idx = i,
+					cmd = cmd,
+					selected = history_selected[i] or false,
+				})
+			end
+		end
+		if #display_rows == 0 then
+			display_rows[1] = { kind = "empty_search", text = "No commands matching \"" .. search_query .. "\"." }
 		end
 		return
 	end
 
+	-- Tab 3: Procedures
 	if active_tab == 3 then
 		local procs = state and state.procedures or {}
 		if #procs == 0 then
-			display_rows[1] = { kind = "msg", text = "No procedures defined yet." }
-			display_rows[2] = { kind = "msg", text = "  → Press '2' for History, select commands with Space, and press 'p'" }
-			display_rows[3] = { kind = "msg", text = "  → In REPL: run jEMach.make_procedure(:name, last=3)" }
+			display_rows[1] = { kind = "empty_proc" }
 			return
 		end
+
 		for i, p in ipairs(procs) do
-			table.insert(display_rows, {
-				kind = "procedure",
-				idx = i,
-				name = p.name,
-				signature = p.signature or (p.name .. "()"),
-				file = p.file or "",
-				doc = p.doc or "",
-				code = p.code or "",
-				time_ms = p.time_ms or 0.0,
-				alloc_bytes = p.alloc_bytes or 0,
-				status = p.status or "never",
-				last_run = p.last_run or "-",
-			})
+			local pname = p.name or ""
+			local psig = p.signature or (pname .. "()")
+			local pdoc = p.doc or ""
+			local pfile = p.file or ""
+			local pcode = p.code or ""
+
+			local match = true
+			if has_filter then
+				match = (pname:lower():find(q, 1, true) ~= nil)
+					or (psig:lower():find(q, 1, true) ~= nil)
+					or (pdoc:lower():find(q, 1, true) ~= nil)
+					or (pfile:lower():find(q, 1, true) ~= nil)
+					or (pcode:lower():find(q, 1, true) ~= nil)
+			end
+
+			if match then
+				table.insert(display_rows, {
+					kind = "procedure",
+					idx = i,
+					name = pname,
+					signature = psig,
+					file = pfile,
+					doc = pdoc,
+					code = pcode,
+					time_ms = p.time_ms or 0.0,
+					alloc_bytes = p.alloc_bytes or 0,
+					status = p.status or "never",
+					last_run = p.last_run or "-",
+				})
+			end
+		end
+
+		if #display_rows == 0 then
+			display_rows[1] = { kind = "empty_search", text = "No procedures matching \"" .. search_query .. "\"." }
 		end
 		return
 	end
 
-	-- active_tab == 1 (Workspace)
+	-- Tab 1: Workspace
 	if not state or (not state.modules and not state.columns) then
 		display_rows[1] = {
 			kind = "msg",
@@ -681,9 +899,21 @@ local function build_display_rows()
 			end
 
 			local iname = cols.names[i] or "?"
+			local itype = (cols.types and cols.types[i]) or ""
+			local ival = (cols.values and cols.values[i]) or ""
 			local key = current_mod .. "/" .. ((cols.exprs and cols.exprs[i]) or iname)
 			if hidden[key] then
 				goto continue
+			end
+
+			if has_filter then
+				local match = iname:lower():find(q, 1, true)
+					or itype:lower():find(q, 1, true)
+					or ival:lower():find(q, 1, true)
+					or current_mod:lower():find(q, 1, true)
+				if not match then
+					goto continue
+				end
 			end
 
 			local has_children = cols.has_children and cols.has_children[i] or false
@@ -698,8 +928,8 @@ local function build_display_rows()
 				module_name = current_mod,
 				name = iname,
 				item_kind = (cols.kinds and cols.kinds[i]) or "variable",
-				item_type = (cols.types and cols.types[i]) or "",
-				value = (cols.values and cols.values[i]) or "",
+				item_type = itype,
+				value = ival,
 				expr = (cols.exprs and cols.exprs[i]) or iname,
 				depth = depth,
 				path = key,
@@ -715,16 +945,28 @@ local function build_display_rows()
 		end
 
 		if #display_rows == 0 then
-			display_rows[1] = { kind = "msg", text = "No variables in workspace." }
+			if has_filter then
+				display_rows[1] = { kind = "empty_search", text = "No variables matching \"" .. search_query .. "\"." }
+			else
+				display_rows[1] = { kind = "msg", text = "No variables in workspace." }
+			end
 		end
 		return
 	end
 
+	-- Fallback for legacy state.modules structure
 	local function add_item_rows(mname, item, depth, path)
 		local iname = item.name or "?"
+		local itype = item.type or ""
+		local ival = item.value or ""
 		local key = path .. "/" .. iname
-		if hidden[key] then
-			return
+		if hidden[key] then return end
+
+		if has_filter then
+			local match = iname:lower():find(q, 1, true)
+				or itype:lower():find(q, 1, true)
+				or ival:lower():find(q, 1, true)
+			if not match then return end
 		end
 
 		local has_children = item.children and #item.children > 0
@@ -739,8 +981,8 @@ local function build_display_rows()
 			module_name = mname,
 			name = iname,
 			item_kind = item.kind or "variable",
-			item_type = item.type or "",
-			value = item.value or "",
+			item_type = itype,
+			value = ival,
 			expr = item.expr or iname,
 			depth = depth,
 			path = key,
@@ -755,7 +997,7 @@ local function build_display_rows()
 		end
 	end
 
-	for _, mod in ipairs(state.modules) do
+	for _, mod in ipairs(state.modules or {}) do
 		local mname = mod.name or "?"
 		if not hidden[mname] then
 			local is_collapsed = collapsed[mname]
@@ -776,7 +1018,11 @@ local function build_display_rows()
 	end
 
 	if #display_rows == 0 then
-		display_rows[1] = { kind = "msg", text = "Workspace is empty." }
+		if has_filter then
+			display_rows[1] = { kind = "empty_search", text = "No variables matching \"" .. search_query .. "\"." }
+		else
+			display_rows[1] = { kind = "msg", text = "Workspace is empty." }
+		end
 	end
 end
 
@@ -809,7 +1055,6 @@ end
 -- tmux send-keys to Julia REPL
 -- ---------------------------------------------------------------------------
 local function tmux_send(code)
-	-- Escape single-quotes for shell
 	local escaped = code:gsub("'", "'\\''")
 	os.execute(string.format("tmux send-keys -t '%s' '%s' Enter", repl_pane, escaped))
 end
@@ -817,28 +1062,15 @@ end
 -- ---------------------------------------------------------------------------
 -- Rendering
 -- ---------------------------------------------------------------------------
-local function pad_right(s, width)
-	s = tostring(s or "")
-	if #s >= width then
-		return s:sub(1, width)
-	end
-	return s .. string.rep(" ", width - #s)
-end
-
-local KIND_COLOR = {
-	["function"] = FG_CYAN,
-	["type"] = FG_YELLOW,
-	["variable"] = FG_WHITE,
-	["module"] = FG_GREEN,
-}
-
 local function render(term_rows, term_cols)
 	local out_buf = {}
 	table.insert(out_buf, HIDE_CUR .. CLEAR)
 
-	-- Title / Tab bar
+	-- Row 1: Header / Tab bar
 	table.insert(out_buf, move(1, 1))
 	local tab_parts = {}
+	table.insert(tab_parts, BOLD .. FG_CYAN .. "◆ jEMach" .. RESET)
+
 	for i = 1, 4 do
 		local name = TAB_NAMES[i]
 		local badge = ""
@@ -849,69 +1081,115 @@ local function render(term_rows, term_cols)
 		elseif i == 4 and state and state.packages and #state.packages > 0 then
 			badge = " (" .. #state.packages .. ")"
 		end
+
 		local t_str = " [" .. i .. "] " .. name .. badge .. " "
 		if i == active_tab then
-			table.insert(tab_parts, REV .. BOLD .. FG_GREEN .. t_str .. RESET)
+			table.insert(tab_parts, BOLD .. FG_WHITE .. BG_TAB_ACT .. t_str .. RESET)
 		else
-			table.insert(tab_parts, DIM .. t_str .. RESET)
+			table.insert(tab_parts, DIM .. FG_WHITE .. t_str .. RESET)
 		end
 	end
+
+	local match_count = #display_rows
+	if #display_rows == 1 and (display_rows[1].kind == "empty_search" or display_rows[1].kind == "empty_proc" or display_rows[1].kind == "msg") then
+		match_count = 0
+	end
+
+	if search_query ~= "" then
+		table.insert(tab_parts, BOLD .. FG_YELLOW .. " 🔍 \"" .. search_query .. "\" (" .. match_count .. ") " .. RESET)
+	end
+
 	local left_title = table.concat(tab_parts, " ")
 
 	local right_info
 	if toast_msg and os.time() <= toast_expires then
-		right_info = REV .. BOLD .. FG_GREEN .. " " .. toast_msg .. " " .. RESET
+		right_info = REV .. BOLD .. FG_GREEN .. " ⚡ " .. toast_msg .. " " .. RESET
 	else
-		local sock_icon = (socket_fd >= 0) and (FG_GREEN .. "●" .. RESET) or (DIM .. "○" .. RESET)
+		local sock_icon = (socket_fd >= 0) and (FG_GREEN .. "● ONLINE" .. RESET) or (DIM .. FG_RED .. "○ OFFLINE" .. RESET)
 		local ts_str = (last_state_ts > 0) and os.date("%H:%M:%S", last_state_ts) or "--:--:--"
-		right_info = DIM .. "[" .. repl_pane .. "] " .. sock_icon .. " " .. ts_str .. RESET
+		right_info = DIM .. FG_GRAY .. "[" .. repl_pane .. "] " .. RESET .. sock_icon .. " " .. DIM .. FG_GRAY .. ts_str .. RESET
 	end
 
-	table.insert(out_buf, left_title .. "  " .. right_info)
+	local left_len = visible_len(left_title)
+	local right_len = visible_len(right_info)
+	local spacer_len = math.max(1, term_cols - left_len - right_len)
+	table.insert(out_buf, left_title .. string.rep(" ", spacer_len) .. right_info)
 
-	-- Separator
+	-- Row 2: Top Separator
 	table.insert(out_buf, move(2, 1))
-	table.insert(out_buf, DIM .. string.rep("─", term_cols) .. RESET)
+	table.insert(out_buf, FG_DARK_GRAY .. string.rep("─", term_cols) .. RESET)
 
-	local content_rows = term_rows - 4
+	-- Row 3: Column Headers
+	table.insert(out_buf, move(3, 1))
+	local col_hdr = ""
+	if active_tab == 1 then
+		col_hdr = DIM .. FG_AQUA .. "   NAME                       TYPE                 VALUE" .. RESET
+	elseif active_tab == 2 then
+		col_hdr = DIM .. FG_AQUA .. "   SEL    #   COMMAND" .. RESET
+	elseif active_tab == 3 then
+		col_hdr = DIM .. FG_AQUA .. "   STATUS  PROCEDURE / SIGNATURE         BENCHMARK / METRICS     FILE" .. RESET
+	elseif active_tab == 4 then
+		col_hdr = DIM .. FG_AQUA .. "   PACKAGE                                  VERSION" .. RESET
+	end
+	table.insert(out_buf, pad_right(col_hdr, term_cols))
+
+	-- Row 4: Subtle Header Divider
+	table.insert(out_buf, move(4, 1))
+	table.insert(out_buf, FG_DARK_GRAY .. string.rep("┄", term_cols) .. RESET)
+
+	local header_rows = 4
+	local content_rows = math.max(1, term_rows - header_rows - 2)
 	local total = #display_rows
 
 	if active_tab == 3 and total > 0 and display_rows[1].kind == "procedure" then
 		-- Split view for procedures: top part list, bottom part code preview
-		local list_max_h = math.min(total, math.max(3, math.floor(content_rows * 0.45)))
-		local preview_h = content_rows - list_max_h - 1
+		local list_max_h = math.min(total, math.max(3, math.floor(content_rows * 0.42)))
+		local preview_h = math.max(1, content_rows - list_max_h - 1)
 
 		local win_start = 1
 		if cursor > list_max_h then
 			win_start = cursor - list_max_h + 1
 		end
 
-		local row_idx = 3
+		local row_idx = header_rows + 1
 		for i = win_start, math.min(win_start + list_max_h - 1, total) do
 			local dr = display_rows[i]
 			local sel = (i == cursor)
 			table.insert(out_buf, move(row_idx, 1))
 
-			local icon = (dr.status == "ok") and (FG_GREEN .. "✓ " .. RESET) or (dr.status == "error") and (FG_RED .. "✗ " .. RESET) or (DIM .. "○ " .. RESET)
-			local sig_col = pad_right(dr.signature, 36)
-			local metrics = (dr.status ~= "never") and string.format("%6.2fms %6dB  %s", dr.time_ms, dr.alloc_bytes, dr.last_run) or "never run"
-			metrics = pad_right(metrics, 26)
-			local file_col = pad_right(dr.file, math.max(0, term_cols - 36 - 26 - 6))
+			local icon = (dr.status == "ok") and (FG_GREEN .. " ✓ " .. RESET)
+				or (dr.status == "error") and (FG_RED .. " ✗ " .. RESET)
+				or (DIM .. FG_GRAY .. " ○ " .. RESET)
 
-			if sel then
-				table.insert(out_buf, icon .. REV .. FG_CYAN .. sig_col .. RESET .. " " .. FG_YELLOW .. metrics .. RESET .. " " .. DIM .. file_col .. RESET)
+			local sig_w = 34
+			local sig_col = pad_right(dr.signature, sig_w)
+			local metrics
+			if dr.status ~= "never" then
+				metrics = string.format("%6.2fms %6dB  %s", dr.time_ms, dr.alloc_bytes, dr.last_run)
 			else
-				table.insert(out_buf, icon .. FG_CYAN .. sig_col .. RESET .. " " .. FG_YELLOW .. metrics .. RESET .. " " .. DIM .. file_col .. RESET)
+				metrics = "never run"
 			end
+			metrics = pad_right(metrics, 28)
+			local file_w = math.max(0, term_cols - sig_w - 28 - 7)
+			local file_col = pad_right(dr.file, file_w)
+
+			local line_content
+			if sel then
+				line_content = icon .. REV .. BOLD .. FG_CYAN .. sig_col .. RESET .. " " .. FG_YELLOW .. metrics .. RESET .. " " .. DIM .. FG_GRAY .. file_col .. RESET
+			else
+				line_content = icon .. BOLD .. FG_WHITE .. sig_col .. RESET .. " " .. FG_YELLOW .. metrics .. RESET .. " " .. DIM .. FG_GRAY .. file_col .. RESET
+			end
+			table.insert(out_buf, line_content)
 			row_idx = row_idx + 1
 		end
 
 		-- Preview separator
-		local split_row = 3 + list_max_h
+		local split_row = header_rows + 1 + list_max_h
 		table.insert(out_buf, move(split_row, 1))
 		local sel_proc = display_rows[cursor]
 		local preview_title = sel_proc and (" Source: " .. sel_proc.file .. " ") or " Source Preview "
-		table.insert(out_buf, DIM .. "──" .. FG_CYAN .. preview_title .. RESET .. DIM .. string.rep("─", math.max(0, term_cols - #preview_title - 2)) .. RESET)
+		local fill_w = math.max(0, term_cols - visible_len(preview_title) - 4)
+		table.insert(out_buf, FG_AQUA .. "╭─ " .. BOLD .. FG_WHITE .. preview_title .. RESET .. FG_AQUA .. string.rep("─", fill_w) .. "╮" .. RESET)
 
 		-- Preview body
 		local preview_row = split_row + 1
@@ -919,18 +1197,23 @@ local function render(term_rows, term_cols)
 			local code_lines = split_lines(sel_proc.code)
 			for li = 1, math.min(#code_lines, preview_h) do
 				table.insert(out_buf, move(preview_row, 1))
-				table.insert(out_buf, FG_WHITE .. pad_right("  " .. code_lines[li], term_cols) .. RESET)
+				local gutter = DIM .. FG_YELLOW .. string.format("%3d ", li) .. RESET .. FG_DARK_GRAY .. "│ " .. RESET
+				local highlighted = highlight_julia_line(code_lines[li])
+				table.insert(out_buf, gutter .. truncate_visible(highlighted, term_cols - 6))
 				preview_row = preview_row + 1
 			end
+		else
+			table.insert(out_buf, move(preview_row, 1))
+			table.insert(out_buf, DIM .. FG_GRAY .. "    (No source code preview available)" .. RESET)
 		end
 	else
-		-- Full height list for Workspace, History, Packages
+		-- Full height list for Workspace, History, Packages (and empty states)
 		local win_start = 1
 		if cursor > content_rows then
 			win_start = cursor - content_rows + 1
 		end
 
-		local row_idx = 3
+		local row_idx = header_rows + 1
 		for i = win_start, math.min(win_start + content_rows - 1, total) do
 			local dr = display_rows[i]
 			local sel = (i == cursor)
@@ -938,50 +1221,67 @@ local function render(term_rows, term_cols)
 
 			if dr.kind == "module" then
 				local color = FG_GREEN
-				local line = string.format("  %s %-20s", dr.icon, dr.name)
+				local icon = dr.collapsed and "▶" or "▼"
+				local line = string.format("  %s %-20s", icon, dr.name)
 				if sel then
-					table.insert(out_buf, REV .. BOLD .. pad_right(line, term_cols) .. RESET)
+					table.insert(out_buf, REV .. BOLD .. FG_GREEN .. pad_right(line, term_cols) .. RESET)
 				else
-					table.insert(out_buf, color .. BOLD .. pad_right(line, term_cols) .. RESET)
+					table.insert(out_buf, BOLD .. FG_GREEN .. pad_right(line, term_cols) .. RESET)
 				end
 			elseif dr.kind == "item" then
-				local kc = KIND_COLOR[dr.item_kind] or FG_WHITE
-				local indent = string.rep("  ", dr.depth or 0)
-				local item_icon = dr.icon ~= "" and (dr.icon .. " ") or "  "
-				local name_text = "    " .. indent .. item_icon .. dr.name
-				local name_col = pad_right(name_text, 26)
-				local type_col = pad_right(dr.item_type, 18)
-				local val_col = dr.value
-				local fixed_w = 26 + 18 + 4
-				local val_max = math.max(0, term_cols - fixed_w - 1)
-				if #val_col > val_max then
-					val_col = val_col:sub(1, val_max - 1) .. "…"
+				local kind_icon = "▪ "
+				local kc = FG_WHITE
+				if dr.item_kind == "function" then
+					kind_icon = "λ "
+					kc = FG_CYAN
+				elseif dr.item_kind == "module" then
+					kind_icon = "◆ "
+					kc = FG_GREEN
+				elseif dr.item_kind == "type" then
+					kind_icon = "◇ "
+					kc = FG_PURPLE
+				elseif dr.item_type:find("DataFrame") or dr.item_type:find("Matrix") then
+					kind_icon = "▦ "
+					kc = FG_YELLOW
+				elseif dr.item_type:find("Vector") or dr.item_type:find("Array") then
+					kind_icon = "▤ "
+					kc = FG_ORANGE
+				elseif dr.item_type:find("Dict") or dr.item_type:find("Set") then
+					kind_icon = "⚿ "
+					kc = FG_TEAL
 				end
-				val_col = pad_right(val_col, term_cols - 26 - 18 - 4)
+
+				local indent = string.rep("  ", dr.depth or 0)
+				local tree_icon = dr.has_children and (dr.icon ~= "" and dr.icon .. " " or "  ") or kind_icon
+				local name_text = "    " .. indent .. tree_icon .. dr.name
+				local name_col = pad_right(name_text, 28)
+				local type_col = pad_right(dr.item_type, 20)
+				local fixed_w = 28 + 20 + 4
+				local val_max = math.max(0, term_cols - fixed_w)
+				local val_col = truncate_visible(dr.value, val_max)
+				val_col = pad_right(val_col, val_max)
 
 				if sel then
 					local out_str
 					if col_cursor == 1 then
-						out_str = REV .. name_col .. RESET .. kc .. "  " .. type_col .. "  " .. val_col
+						out_str = REV .. name_col .. RESET .. "  " .. kc .. type_col .. "  " .. FG_WHITE .. val_col
 					elseif col_cursor == 2 then
-						out_str = name_col .. "  " .. REV .. type_col .. RESET .. kc .. "  " .. val_col
+						out_str = name_col .. "  " .. REV .. kc .. type_col .. RESET .. "  " .. FG_WHITE .. val_col
 					else
-						out_str = name_col .. "  " .. type_col .. "  " .. REV .. val_col .. RESET
+						out_str = name_col .. "  " .. kc .. type_col .. "  " .. REV .. FG_WHITE .. val_col .. RESET
 					end
 					table.insert(out_buf, kc .. out_str .. RESET)
 				else
-					table.insert(out_buf, kc .. name_col .. "  " .. type_col .. "  " .. val_col .. RESET)
+					table.insert(out_buf, kc .. name_col .. "  " .. FG_GRAY .. type_col .. "  " .. FG_WHITE .. val_col .. RESET)
 				end
 			elseif dr.kind == "history" then
 				local is_sel = history_selected[dr.idx]
-				local check = is_sel and (FG_GREEN .. BOLD .. "[x] " .. RESET) or (DIM .. "[ ] " .. RESET)
+				local check = is_sel and (FG_GREEN .. BOLD .. " [✓] " .. RESET) or (DIM .. FG_GRAY .. " [ ] " .. RESET)
 				local num = FG_YELLOW .. string.format("%3d: ", dr.idx) .. RESET
-				local cmd_text = dr.cmd:gsub("\n", " ⏎ ")
-				local max_w = math.max(10, term_cols - 12)
-				if #cmd_text > max_w then
-					cmd_text = cmd_text:sub(1, max_w - 1) .. "…"
-				end
-				local line_text = pad_right(cmd_text, max_w)
+				local cmd_text = dr.cmd:gsub("\n", FG_PURPLE .. " ⏎ " .. RESET)
+				local max_w = math.max(10, term_cols - 14)
+				local line_text = truncate_visible(cmd_text, max_w)
+				line_text = pad_right(line_text, max_w)
 				if sel then
 					table.insert(out_buf, check .. num .. REV .. line_text .. RESET)
 				else
@@ -995,6 +1295,37 @@ local function render(term_rows, term_cols)
 				else
 					table.insert(out_buf, FG_CYAN .. name_col .. "  " .. FG_YELLOW .. ver_col .. RESET)
 				end
+			elseif dr.kind == "empty_proc" then
+				local box_w = math.min(62, term_cols - 4)
+				local pad = string.rep("─", box_w - 4)
+				table.insert(out_buf, FG_AQUA .. "  ╭─ " .. BOLD .. "✦ No procedures defined yet " .. RESET .. FG_AQUA .. pad:sub(28) .. "╮" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_AQUA .. "  │" .. RESET .. pad_right("  Quick Start:", box_w - 2) .. FG_AQUA .. "│" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_AQUA .. "  │" .. RESET .. pad_right("  1. Press [2] for History, select commands with [Space]", box_w - 2) .. FG_AQUA .. "│" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_AQUA .. "  │" .. RESET .. pad_right("  2. Press [p] to Make Procedure with auto-AST parameters", box_w - 2) .. FG_AQUA .. "│" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_AQUA .. "  │" .. RESET .. pad_right("  3. Or in Julia REPL: jEMach.make_procedure(:name, last=4)", box_w - 2) .. FG_AQUA .. "│" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_AQUA .. "  ╰" .. string.rep("─", box_w - 2) .. "╯" .. RESET)
+			elseif dr.kind == "empty_search" then
+				local box_w = math.min(54, term_cols - 4)
+				table.insert(out_buf, FG_YELLOW .. "  ╭─ " .. BOLD .. "🔍 Search Filter " .. RESET .. FG_YELLOW .. string.rep("─", box_w - 19) .. "╮" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_YELLOW .. "  │" .. RESET .. pad_right("  " .. (dr.text or "No matches found."), box_w - 2) .. FG_YELLOW .. "│" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_YELLOW .. "  │" .. RESET .. DIM .. pad_right("  Press [Esc] or 'x' to clear search filter", box_w - 2) .. RESET .. FG_YELLOW .. "│" .. RESET)
+				row_idx = row_idx + 1
+				table.insert(out_buf, move(row_idx, 1))
+				table.insert(out_buf, FG_YELLOW .. "  ╰" .. string.rep("─", box_w - 2) .. "╯" .. RESET)
 			elseif dr.kind == "msg" then
 				table.insert(out_buf, DIM .. pad_right("  " .. (dr.text or ""), term_cols) .. RESET)
 			end
@@ -1003,40 +1334,52 @@ local function render(term_rows, term_cols)
 		end
 	end
 
-	-- Bottom separator + help line
+	-- Row term_rows - 1: Search Prompt / Bottom Divider
 	table.insert(out_buf, move(term_rows - 1, 1))
-	table.insert(out_buf, DIM .. string.rep("─", term_cols) .. RESET)
-
-	table.insert(out_buf, move(term_rows, 1))
-	local help
-	if active_tab == 1 then
-		help = " 1..4:tabs  j/k:move  h/l:col/fold  ↵:eval  TAB:next tab  i:inspect  s:save  q:quit"
-	elseif active_tab == 2 then
-		help = " 1..4:tabs  j/k:move  Space:select  a:all  p:Make Procedure  ↵:send to REPL  q:quit"
-	elseif active_tab == 3 then
-		help = " 1..4:tabs  j/k:move  ↵:Run  e:Edit args  d:delete  r:reload  q:quit"
-	elseif active_tab == 4 then
-		help = " 1..4:tabs  j/k:move  a:add  d:remove  u:update  q:quit"
+	if search_mode then
+		local sbar = BOLD .. FG_YELLOW .. " 🔍 Search: " .. RESET .. BOLD .. FG_WHITE .. search_query .. REV .. " " .. RESET .. DIM .. FG_GRAY .. "  [Enter] Confirm filter   [Esc] Clear filter" .. RESET
+		table.insert(out_buf, pad_right(sbar, term_cols))
+	elseif search_query ~= "" then
+		local sbar = DIM .. FG_YELLOW .. " 🔍 Active Filter: \"" .. search_query .. "\" (" .. match_count .. " matches) — Press 'x' or [Esc] to clear" .. RESET
+		table.insert(out_buf, pad_right(sbar, term_cols))
+	else
+		table.insert(out_buf, FG_DARK_GRAY .. string.rep("─", term_cols) .. RESET)
 	end
-	table.insert(out_buf, DIM .. pad_right(help, term_cols) .. RESET)
+
+	-- Row term_rows: Shortcut Pills
+	table.insert(out_buf, move(term_rows, 1))
+	local function pill(k, d)
+		return BOLD .. FG_CYAN .. "[" .. k .. "] " .. RESET .. DIM .. FG_LIGHT_GRAY .. d .. "  " .. RESET
+	end
+	local help = ""
+	if active_tab == 1 then
+		help = pill("/", "Search") .. pill("1-4", "Tabs") .. pill("j/k", "Nav") .. pill("h/l", "Fold/Col") .. pill("↵", "Eval") .. pill("i", "Inspect") .. pill("s", "Save") .. pill("q", "Quit")
+	elseif active_tab == 2 then
+		help = pill("/", "Search") .. pill("1-4", "Tabs") .. pill("j/k", "Nav") .. pill("Space", "Select") .. pill("a", "All") .. pill("p", "Make Proc") .. pill("↵", "Send") .. pill("q", "Quit")
+	elseif active_tab == 3 then
+		help = pill("/", "Search") .. pill("1-4", "Tabs") .. pill("j/k", "Nav") .. pill("↵", "Run") .. pill("e", "Edit") .. pill("d", "Delete") .. pill("r", "Reload") .. pill("q", "Quit")
+	elseif active_tab == 4 then
+		help = pill("/", "Search") .. pill("1-4", "Tabs") .. pill("j/k", "Nav") .. pill("a", "Add") .. pill("d", "Remove") .. pill("u", "Update") .. pill("q", "Quit")
+	end
+	table.insert(out_buf, pad_right(" " .. help, term_cols))
 
 	-- Modal popup overlay if active
 	if modal_active then
-		local box_w = math.min(54, term_cols - 4)
+		local box_w = math.min(56, term_cols - 4)
 		local box_h = 5
 		local top = math.floor((term_rows - box_h) / 2)
 		local left = math.floor((term_cols - box_w) / 2)
 
 		local title = " " .. modal_title .. " "
-		local fill_w = math.max(0, box_w - 4 - #title)
-		local top_border = "┌─" .. title .. string.rep("─", fill_w) .. "┐"
-		local bot_border = "└" .. string.rep("─", box_w - 2) .. "┘"
-		local prompt_line = "  Name: " .. modal_input .. REV .. " " .. RESET
-		local hint_line = "  [Enter] Confirm   [Esc] Cancel"
+		local fill_w = math.max(0, box_w - 4 - visible_len(title))
+		local top_border = "╭─" .. BOLD .. FG_WHITE .. title .. RESET .. FG_CYAN .. string.rep("─", fill_w) .. "╮"
+		local bot_border = "╰" .. string.rep("─", box_w - 2) .. "╯"
+		local prompt_line = "  Input: " .. BOLD .. FG_YELLOW .. modal_input .. RESET .. REV .. " " .. RESET
+		local hint_line = "  " .. FG_GREEN .. "[Enter]" .. RESET .. DIM .. " Confirm   " .. RESET .. FG_RED .. "[Esc]" .. RESET .. DIM .. " Cancel" .. RESET
 
 		table.insert(out_buf, move(top, left) .. BOLD .. FG_CYAN .. top_border .. RESET)
 		table.insert(out_buf, move(top + 1, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. pad_right(prompt_line, box_w - 2) .. BOLD .. FG_CYAN .. "│" .. RESET)
-		table.insert(out_buf, move(top + 2, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. DIM .. pad_right(hint_line, box_w - 2) .. RESET .. BOLD .. FG_CYAN .. "│" .. RESET)
+		table.insert(out_buf, move(top + 2, left) .. BOLD .. FG_CYAN .. "│" .. RESET .. pad_right(hint_line, box_w - 2) .. BOLD .. FG_CYAN .. "│" .. RESET)
 		table.insert(out_buf, move(top + 3, left) .. BOLD .. FG_CYAN .. bot_border .. RESET)
 	end
 
@@ -1086,9 +1429,59 @@ local function handle_key(key, term_rows, term_cols)
 		return
 	end
 
+	-- Search mode interception
+	if search_mode then
+		if key == "\27" then -- ESC
+			search_mode = false
+			search_query = ""
+			build_display_rows()
+			clamp_cursor()
+			dirty = true
+			return
+		elseif key == "\r" or key == "\n" then -- Enter (keeps active filter)
+			search_mode = false
+			build_display_rows()
+			clamp_cursor()
+			dirty = true
+			return
+		elseif key == "\127" or key == "\8" then -- Backspace
+			if #search_query > 0 then
+				search_query = search_query:sub(1, #search_query - 1)
+				build_display_rows()
+				clamp_cursor()
+				dirty = true
+			end
+			return
+		elseif #key == 1 and key:byte(1) >= 32 and key:byte(1) <= 126 then
+			search_query = search_query .. key
+			build_display_rows()
+			clamp_cursor()
+			dirty = true
+			return
+		end
+		return
+	end
+
 	-- Normal mode quit
 	if key == "q" then
 		return "quit"
+	end
+
+	-- Enter search mode
+	if key == "/" then
+		search_mode = true
+		dirty = true
+		return
+	end
+
+	-- Clear active search filter with ESC or x
+	if (key == "\27" or key == "x") and search_query ~= "" then
+		search_query = ""
+		build_display_rows()
+		clamp_cursor()
+		set_toast("Search filter cleared")
+		dirty = true
+		return
 	end
 
 	-- Direct tab jump keys
@@ -1283,7 +1676,7 @@ local function handle_key(key, term_rows, term_cols)
 						table.insert(sel_indices, tostring(i))
 					end
 				end
-				if #sel_indices == 0 and display_rows[cursor] then
+				if #sel_indices == 0 and display_rows[cursor] and display_rows[cursor].idx then
 					table.insert(sel_indices, tostring(display_rows[cursor].idx))
 				end
 				local cmd = string.format("jEMach.make_procedure(:%s; indices=[%s])", name, table.concat(sel_indices, ","))
@@ -1312,15 +1705,22 @@ local function handle_key(key, term_rows, term_cols)
 			end
 		elseif key == "d" then
 			if dr and dr.kind == "procedure" then
-				local confirm = prompt_input("Delete procedure '" .. dr.name .. "'? (y/n): ")
-				if confirm == "y" or confirm == "yes" or confirm == "Y" then
-					tmux_send(string.format("rm(%q); jEMach._load_procedures!(); jEMach.publish_state()", dr.file))
-					set_toast("Deleted procedure " .. dr.name)
+				modal_active = true
+				modal_title = "Delete procedure '" .. dr.name .. "'? (y/n)"
+				modal_input = ""
+				modal_callback = function(ans)
+					local a = ans:lower():gsub("%s+", "")
+					if a == "y" or a == "yes" then
+						tmux_send(string.format("rm(joinpath(jEMach._get_project_dir(), %q), force=true); jEMach._load_procedures!(); jEMach.publish_state()", dr.file))
+						set_toast("Deleted procedure " .. dr.name)
+					end
 				end
 			end
 		elseif key == "r" then
 			tmux_send("jEMach._load_procedures!(); jEMach.publish_state()")
 			set_toast("Reloaded procedures")
+		elseif key == "c" then
+			os.execute(string.format("tmux send-keys -t '%s' C-l", repl_pane))
 		end
 
 	-- -----------------------------------------------------------------------
@@ -1329,22 +1729,36 @@ local function handle_key(key, term_rows, term_cols)
 	elseif active_tab == 4 then
 		local dr = display_rows[cursor]
 		if key == "a" then
-			local pkg_name = prompt_input("Enter package name to add: ")
-			if pkg_name and pkg_name ~= "" then
-				tmux_send(string.format("import Pkg; Pkg.add(%q)", pkg_name))
+			modal_active = true
+			modal_title = "Add Julia Package"
+			modal_input = ""
+			modal_callback = function(pkg_name)
+				pkg_name = pkg_name:gsub("%s+", "")
+				if pkg_name ~= "" then
+					tmux_send(string.format("import Pkg; Pkg.add(%q)", pkg_name))
+					set_toast("Adding package " .. pkg_name .. "...")
+				end
 			end
 		elseif key == "d" then
 			if dr and dr.kind == "package" then
-				local confirm = prompt_input("Remove package '" .. dr.name .. "'? (y/n): ")
-				if confirm == "y" or confirm == "yes" or confirm == "Y" then
-					tmux_send(string.format("import Pkg; Pkg.rm(%q)", dr.name))
+				modal_active = true
+				modal_title = "Remove package '" .. dr.name .. "'? (y/n)"
+				modal_input = ""
+				modal_callback = function(ans)
+					local a = ans:lower():gsub("%s+", "")
+					if a == "y" or a == "yes" then
+						tmux_send(string.format("import Pkg; Pkg.rm(%q)", dr.name))
+						set_toast("Removing package " .. dr.name .. "...")
+					end
 				end
 			end
 		elseif key == "u" then
 			if dr and dr.kind == "package" then
 				tmux_send(string.format("import Pkg; Pkg.update(%q)", dr.name))
+				set_toast("Updating " .. dr.name .. "...")
 			else
 				tmux_send("import Pkg; Pkg.update()")
+				set_toast("Updating all packages...")
 			end
 		end
 	end
@@ -1398,7 +1812,7 @@ local function main()
 				dirty = false
 			end
 
-			local key = read_key(REFRESH_MS)
+			local key = get_next_key(REFRESH_MS)
 			if key then
 				dirty = true
 				local result = handle_key(key, term_rows, term_cols)
